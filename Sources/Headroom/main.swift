@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let sampler = SystemSampler()
     private let claudeClient = ClaudeLimitsClient()
     private let grokClient = GrokClient()
+    private let bedrockClient = BedrockClient()
     private let ledger = Ledger()
     private let keepAwake = KeepAwake()
 
@@ -17,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var tick = 0
     private var ledgerBusy = false
     private var claudeBackoffUntil = Date.distantPast
+    private var bedrockBusy = false
     private var currentInterval = 0.0
     private var snapshotDir: URL?
     private var hover: HoverController?
@@ -49,9 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         sample()
         refreshLimits()
         refreshUsage()
+        refreshBedrock()
         timers = [
             Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.refreshLimits() },
             Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.refreshUsage() },
+            // CloudWatch bills per metric requested, so poll gently (about $0.30 a month per region).
+            Timer.scheduledTimer(withTimeInterval: 1800, repeats: true) { [weak self] _ in self?.refreshBedrock() },
         ]
         timers.forEach { $0.tolerance = 2 }
         if snapshotDir != nil {
@@ -67,6 +72,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             self?.refreshLimits()
             self?.refreshUsage()
+            self?.refreshBedrock()
         }
     }
 
@@ -141,17 +147,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let windowStart = store.claudeLimits?.session?.resetsAt.map { $0.addingTimeInterval(-5 * 3600) }
         ledger.refresh(windowStart: windowStart, progress: { [weak self] msg in
             DispatchQueue.main.async { self?.store.indexing = msg }
-        }, completion: { [weak self] claude, grok, lastActivity in
+        }, completion: { [weak self] claude, grok, bedrock, lastActivity in
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.store.claudeUsage = claude
                 self.store.grokUsage = grok
+                self.store.bedrockLocalUsage = bedrock
                 self.store.usageUpdated = Date()
                 self.ledgerBusy = false
                 self.keepAwake.agentActivity = lastActivity
                 self.syncAwake()
             }
         })
+    }
+
+    private func refreshBedrock() {
+        guard !bedrockBusy else { return }
+        bedrockBusy = true
+        store.bedrockConfig = BedrockClient.config()
+        Task { @MainActor in
+            defer { bedrockBusy = false }
+            do {
+                let u = try await bedrockClient.fetch()
+                store.bedrockCloud = u
+                store.bedrockCloudUsage = Ledger.summarize(u.hours, windowStart: nil)
+                store.bedrockError = nil
+            } catch ClientError.notConfigured {
+                store.bedrockCloud = nil
+                store.bedrockCloudUsage = nil
+                store.bedrockError = nil
+            } catch {
+                store.bedrockError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Asks for the AWS profile and regions to read Bedrock metrics from.
+    private func configureBedrock() {
+        popover.performClose(nil)
+        let current = BedrockClient.config()
+        let alert = NSAlert()
+        alert.messageText = "AWS Bedrock"
+        alert.informativeText = "Headroom reads Claude token counts from CloudWatch in these regions with the AWS CLI. "
+            + "The profile needs cloudwatch:GetMetricData. Leave a field empty to use the AWS defaults."
+        let profile = NSTextField(string: UserDefaults.standard.string(forKey: Prefs.bedrockProfile) ?? "")
+        profile.placeholderString = current?.profile ?? "default"
+        let regions = NSTextField(string: UserDefaults.standard.string(forKey: Prefs.bedrockRegions) ?? "")
+        regions.placeholderString = current?.regions.joined(separator: ", ").nilIfEmpty ?? "us-east-1, us-west-2"
+        let stack = NSStackView(views: [NSTextField(labelWithString: "Profile"), profile,
+                                        NSTextField(labelWithString: "Regions (comma-separated)"), regions])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 4
+        stack.frame = NSRect(x: 0, y: 0, width: 280, height: 96)
+        [profile, regions].forEach { $0.widthAnchor.constraint(equalToConstant: 280).isActive = true }
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        UserDefaults.standard.set(profile.stringValue.trimmingCharacters(in: .whitespaces), forKey: Prefs.bedrockProfile)
+        UserDefaults.standard.set(regions.stringValue.trimmingCharacters(in: .whitespaces), forKey: Prefs.bedrockRegions)
+        refreshBedrock()
     }
 
     // MARK: Keep awake
@@ -189,7 +246,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             refresh: { [weak self] in
                 self?.refreshLimits(force: true)
                 self?.refreshUsage()
+                self?.refreshBedrock()
             },
+            configureBedrock: { [weak self] in self?.configureBedrock() },
             quit: { NSApp.terminate(nil) },
             keepAwake: { [weak self] in self?.setAwake($0) }))
         let host = NSHostingController(rootView: view)
@@ -230,7 +289,7 @@ extension AppDelegate {
         }
         print("strip width pt:", strip.size.width)
 
-        let view = PopoverView(store: store, actions: PopoverActions(refresh: {}, quit: {}, keepAwake: { _ in }))
+        let view = PopoverView(store: store, actions: PopoverActions(refresh: {}, configureBedrock: {}, quit: {}, keepAwake: { _ in }))
             .background(Color(nsColor: NSColor(white: 0.13, alpha: 1)))
             .environment(\.colorScheme, .dark)
         let renderer = ImageRenderer(content: view)

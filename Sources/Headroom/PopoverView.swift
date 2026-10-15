@@ -9,6 +9,7 @@ extension Color {
     static let battery = Color(nsColor: Palette.battery)
     static let claude = Color(nsColor: Palette.claude)
     static let grok = Color(nsColor: Palette.grok)
+    static let bedrock = Color(nsColor: Palette.bedrock)
 
     static func severity(_ pct: Double, base: Color) -> Color {
         pct >= 90 ? .red : pct >= 75 ? .orange : base
@@ -17,6 +18,7 @@ extension Color {
 
 struct PopoverActions {
     var refresh: () -> Void
+    var configureBedrock: () -> Void
     var quit: () -> Void
     var keepAwake: (AwakeSession) -> Void
 }
@@ -71,7 +73,9 @@ struct CardHeader: View {
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: icon).foregroundStyle(tint).font(.system(size: 11, weight: .semibold))
+            // Never wrap the title; in the narrow metric cards the big number next to it gives way instead.
             Text(title.uppercased()).font(.system(size: 10, weight: .bold)).tracking(0.6).foregroundStyle(.secondary)
+                .lineLimit(1).fixedSize()
             Spacer(minLength: 4)
             if let trailing {
                 Text(trailing).font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
@@ -86,7 +90,9 @@ struct BigNumber: View {
     let text: String
     var color: Color = .primary
     var body: some View {
+        // Laid out before the card title and scaled down only when "BATTERY 100%" would not fit.
         Text(text).font(.system(size: 22, weight: .semibold, design: .rounded)).monospacedDigit()
+            .lineLimit(1).minimumScaleFactor(0.75).layoutPriority(1)
             .foregroundStyle(color).contentTransition(.numericText())
     }
 }
@@ -290,7 +296,7 @@ struct MetricCard<Extra: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
                 CardHeader(title: title, icon: icon, tint: tint)
                 BigNumber(text: Fmt.pct(value))
             }
@@ -325,7 +331,7 @@ struct BatteryCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
                 CardHeader(title: "Battery", icon: icon, tint: .battery)
                 BigNumber(text: Fmt.pct(battery?.percent), color: low ? .red : .primary)
             }
@@ -412,8 +418,12 @@ struct LimitsCard: View {
                     Text("\(err), showing data from \(Fmt.ago(store.grokPlan?.fetchedAt))").font(.system(size: 10)).foregroundStyle(.orange)
                 }
             }
-            if !store.claudeAvailable && !store.grokAvailable {
-                Text("No Claude Code or Grok account found").font(.system(size: 11)).foregroundStyle(.secondary)
+            if store.bedrockAvailable {
+                if store.claudeAvailable || store.grokAvailable { Divider().opacity(0.5) }
+                BedrockSection(store: store)
+            }
+            if !store.claudeAvailable && !store.grokAvailable && !store.bedrockAvailable {
+                Text("No Claude Code, Grok or AWS Bedrock account found").font(.system(size: 11)).foregroundStyle(.secondary)
             }
         }
         .padding(12)
@@ -426,6 +436,40 @@ struct LimitsCard: View {
     }
 }
 
+/// Bedrock has no plan limits, so this shows where its numbers come from and the 30-day spend.
+struct BedrockSection: View {
+    @ObservedObject var store: Store
+
+    var body: some View {
+        let cloud = store.bedrockFromCloudWatch
+        VStack(alignment: .leading, spacing: 6) {
+            CardHeader(title: "AWS Bedrock", icon: "cloud", tint: .bedrock,
+                       trailing: cloud ? store.bedrockCloud?.config.regions.joined(separator: ", ") : "Claude Code")
+            if let u = store.bedrockUsage {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Claude, last 30 days").font(.system(size: 12, weight: .medium))
+                    Spacer()
+                    Text("\(Fmt.tokens(u.month.tokens))  \(Fmt.usd(u.month.cost))")
+                        .font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
+                }
+            }
+            Group {
+                if cloud, let c = store.bedrockCloud {
+                    Text("Account-wide from CloudWatch (\(c.config.profile ?? "default profile")), updated \(Fmt.ago(c.fetchedAt))")
+                } else if store.bedrockUsage != nil {
+                    Text("Claude Code sessions only. Set an AWS profile and region under Settings to include every Bedrock caller.")
+                } else {
+                    Text("No Claude usage found in \(store.bedrockConfig?.label ?? "CloudWatch")")
+                }
+            }
+            .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let err = store.bedrockError {
+                Text(err).font(.system(size: 10)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 // MARK: - Combined token usage
 
 struct UsageCard: View {
@@ -434,17 +478,23 @@ struct UsageCard: View {
 
     var body: some View {
         let grok = store.grokAvailable ? store.grokUsage : nil
-        let combined = UsageSummary.combine(store.claudeUsage, grok)
+        let bedrock = store.bedrockUsage
+        // Bedrock-only setups have no subscription traffic; drop the empty Claude row then.
+        let claude = (store.claudeUsage?.month.tokens ?? 0) > 0 || bedrock == nil ? store.claudeUsage : nil
+        let combined = UsageSummary.combine(UsageSummary.combine(claude, grok), bedrock)
+        let names = [claude.map { _ in "Claude" }, grok.map { _ in "Grok" }, bedrock.map { _ in "Bedrock" }].compactMap { $0 }
         VStack(alignment: .leading, spacing: 10) {
-            CardHeader(title: "Token usage", icon: "chart.bar.xaxis", tint: .claude, trailing: grok == nil ? "Claude Code" : "Claude + Grok")
+            CardHeader(title: "Token usage", icon: "chart.bar.xaxis", tint: .claude,
+                       trailing: names == ["Claude"] ? "Claude Code" : names.joined(separator: " + "))
             HStack(spacing: 6) {
                 StatTile(title: "Today", totals: combined?.today)
                 StatTile(title: "7 days", totals: combined?.week)
                 StatTile(title: "30 days", totals: combined?.month)
             }
             VStack(spacing: 4) {
-                ProviderRow(name: "Claude", color: .claude, summary: store.claudeUsage)
+                if claude != nil { ProviderRow(name: "Claude", color: .claude, summary: claude) }
                 if grok != nil { ProviderRow(name: "Grok", color: .grok, summary: grok) }
+                if bedrock != nil { ProviderRow(name: "Bedrock", color: .bedrock, summary: bedrock) }
             }
             if let w = store.claudeUsage?.window {
                 HStack {
@@ -551,6 +601,7 @@ struct Footer: View {
                     Text("2 s").tag(2.0)
                     Text("5 s").tag(5.0)
                 }
+                Button("AWS Bedrock...", action: actions.configureBedrock)
                 Toggle("Launch at login", isOn: Binding(get: { launchAtLogin }, set: setLaunchAtLogin))
             } label: {
                 Label("Settings", systemImage: "gearshape")

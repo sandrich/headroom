@@ -81,23 +81,35 @@ let appSupportDir: URL = {
 
 let homeDir = FileManager.default.homeDirectoryForCurrentUser
 
-/// Runs a binary and returns its exit status and stdout. Kills it after `timeout` seconds.
+/// Runs a binary and returns its exit status, stdout and (if asked for) stderr. Kills it after `timeout` seconds.
 @discardableResult
-func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 10, captureOutput: Bool = true) -> (status: Int32, output: Data)? {
+func runProcess(_ path: String, _ args: [String], timeout: TimeInterval = 10, captureOutput: Bool = true,
+                captureErrors: Bool = false) -> (status: Int32, output: Data, errors: Data)? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
-    let pipe = Pipe()
+    let pipe = Pipe(), errPipe = Pipe()
     p.standardOutput = captureOutput ? pipe : FileHandle.nullDevice
-    p.standardError = FileHandle.nullDevice
+    p.standardError = captureErrors ? errPipe : FileHandle.nullDevice
     p.standardInput = FileHandle.nullDevice
     do { try p.run() } catch { return nil }
     DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
         if p.isRunning { p.terminate() }
     }
+    // Drain stderr concurrently so a chatty process cannot block on a full pipe.
+    var errors = Data()
+    let group = DispatchGroup()
+    if captureErrors {
+        DispatchQueue.global().async(group: group) { errors = errPipe.fileHandleForReading.readDataToEndOfFile() }
+    }
     let data = captureOutput ? pipe.fileHandleForReading.readDataToEndOfFile() : Data()
     p.waitUntilExit()
-    return (p.terminationStatus, data)
+    group.wait()
+    return (p.terminationStatus, data, errors)
+}
+
+extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 extension Dictionary where Key == String, Value == Any {

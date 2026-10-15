@@ -10,7 +10,7 @@
 
 # Headroom
 
-A tiny macOS menu bar app that shows how much headroom you have left: on your machine (CPU, GPU, memory, battery) and on your AI coding plans (Claude Code and Grok).
+A tiny macOS menu bar app that shows how much headroom you have left: on your machine (CPU, GPU, memory, battery) and on your AI coding plans (Claude Code and Grok), plus your Claude spend on AWS Bedrock.
 
 One compact, native-looking item in the menu bar. Click it for a dashboard with live graphs; hover an item to see what is using it.
 
@@ -33,7 +33,8 @@ One compact, native-looking item in the menu bar. Click it for a dashboard with 
 - Live charts for CPU (with per-core bars), GPU and memory; battery state, power draw, health and cycles
 - Claude Code plan limits with reset countdowns and a pace marker (where you would be if usage were spread evenly)
 - Grok weekly credits
-- Combined token usage for Claude Code and Grok: today, last 7 days, last 30 days, tokens and cost, a 30-day chart by model family, and a per-model table, similar to [ccusage](https://github.com/ryoppippi/ccusage)
+- AWS Bedrock: account-wide Claude tokens and estimated cost from CloudWatch, or, without AWS access, the Claude Code sessions that ran through Bedrock
+- Combined token usage for Claude Code, Grok and Bedrock: today, last 7 days, last 30 days, tokens and cost, a 30-day chart by model family, and a per-model table, similar to [ccusage](https://github.com/ryoppippi/ccusage)
 
 Providers you do not use are hidden automatically.
 
@@ -50,6 +51,7 @@ Providers you do not use are hidden automatically.
 - Xcode command line tools (Swift 5.9+)
 - Optional: [Claude Code](https://claude.com/claude-code) signed in with a Claude subscription
 - Optional: the [Grok CLI](https://x.ai/cli) signed in (`grok login`)
+- Optional: the [AWS CLI](https://aws.amazon.com/cli/) with a profile that can call `cloudwatch:GetMetricData` in your Bedrock regions
 
 ## Install
 
@@ -83,18 +85,28 @@ Everything is sampled locally and cheaply. Steady-state cost is around 1% of one
 | Battery | IOKit power sources and `AppleSmartBattery` |
 | Top apps | `libproc` (`proc_pid_rusage`) and per-client GPU time from the GPU driver's IORegistry entries; only sampled while a hover panel is open |
 | Claude Code limits | The usage endpoint Claude Code itself uses, authenticated with Claude Code's OAuth token from the login keychain (read via `/usr/bin/security`; never stored, logged or refreshed by Headroom) |
-| Claude Code tokens | `~/.claude/projects/**/*.jsonl`, tailed incrementally by byte offset and cached in `~/Library/Application Support/Headroom` |
+| Claude Code tokens | `~/.claude/projects/**/*.jsonl`, plus Cowork sessions from the desktop app (`~/Library/Application Support/Claude*/local-agent-mode-sessions/**/.claude/projects`), tailed incrementally by byte offset and cached in `~/Library/Application Support/Headroom` |
 | Grok credits | The billing endpoint the Grok CLI's `/usage` uses, with the CLI's token from `~/.grok/auth.json`. If that token has expired, Headroom runs `grok models` once so the CLI refreshes it; Headroom never writes the file. |
 | Grok tokens | `~/.grok/sessions/*/*/usage.json` |
+| Bedrock (Claude Code) | Claude Code and Cowork transcripts whose message ids start with `msg_bdrk_`, kept apart from subscription usage |
+| Bedrock (account-wide) | `aws cloudwatch get-metric-data` with a `SEARCH` over the `AWS/Bedrock` token and invocation metrics for every Claude model id, hourly sums for 30 days, refreshed every 30 minutes and cached per region. Credentials stay with the AWS CLI (SSO, `credential_process` and so on all work). When CloudWatch has data it replaces the local Bedrock figures, since it already includes them. |
 | Prices | [LiteLLM's model price list](https://github.com/BerriAI/litellm), refreshed daily |
 
 ### Accuracy notes
 
-- Token totals follow ccusage's rules: deduplicated by message id and request id, keeping the final counts of messages that were logged several times while streaming, and including advisor sub-calls. Days are local calendar days; "7 days" and "30 days" include today.
+- Token totals follow ccusage's rules: deduplicated by message id and request id (message id alone when the request id is missing, as it often is for Bedrock and Cowork), keeping the final counts of messages that were logged several times while streaming, and including advisor sub-calls. Days are local calendar days; "7 days" and "30 days" include today. Totals include cache reads and writes, so they are far higher than the input + output figures the Claude desktop app shows under Settings > Usage.
 - Cost can differ slightly from ccusage because Headroom prices 1-hour cache writes at their own (higher) rate.
 - Grok cost comes from the CLI's own per-turn cost figures.
+- Bedrock cost is estimated from token counts with LiteLLM's Bedrock prices (regional and geo inference profiles such as `au.` or `eu.` include their premium). CloudWatch does not split 5-minute and 1-hour cache writes, so all cache writes are priced at the 5-minute rate. Application inference profiles (ARNs) cannot be mapped to a model and are skipped. It is an estimate, not your AWS bill.
+- Bedrock turns read from Claude Code transcripts do not record their region, so they are priced at Anthropic's list price.
 - Energy in the battery hover panel is shown as each app's share of energy used, because the kernel counters do not have a documented unit.
 - Root-owned processes (for example `WindowServer` CPU or `kernel_task`) cannot be read without elevated rights and are missing from the CPU, memory and energy lists.
+
+### AWS Bedrock setup
+
+Headroom picks an AWS profile and region from `AWS_PROFILE` and `AWS_REGION` when it is launched from a terminal, otherwise from `~/.aws/config` (the `default` profile, or the only profile there is). Usually you will want to set them explicitly under **Settings > AWS Bedrock...** in the dashboard footer: enter the profile and one or more comma-separated regions where you call Bedrock (cross-region inference is metered in the region you call). The same values can be set with `defaults write`, for example `defaults write dev.headroom.Headroom bedrock.regions "ap-southeast-2"` (keys `bedrock.profile` and `bedrock.regions`).
+
+CloudWatch charges $0.01 per 1,000 metrics requested. Each refresh requests one metric per model and counter, which comes to roughly $0.30 a month per region.
 
 ### Caveats
 
@@ -113,7 +125,7 @@ Source layout (`Sources/Headroom`):
 - `main.swift`: app delegate, timers, status item, popover
 - `SystemSampler.swift`: CPU, GPU, memory, battery
 - `Consumers.swift`: per-app top consumers for the hover panels
-- `Clients.swift`: Claude Code and Grok plan limits
+- `Clients.swift`: Claude Code and Grok plan limits, Bedrock CloudWatch usage
 - `Ledger.swift`: token ledger, pricing, summaries
 - `StatusRenderer.swift`: draws the menu bar strip
 - `PopoverView.swift`, `Hover.swift`: SwiftUI dashboard and hover panels

@@ -8,8 +8,15 @@ cd "$(dirname "$0")"
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Resources/Info.plist)
 
-swift build -c release --arch arm64 --arch x86_64
-BIN=$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)/Headroom
+# Build each architecture separately and merge with lipo: `--arch a --arch b` needs Xcode's XCBuild,
+# which the command line tools alone do not include.
+SLICES=()
+for ARCH in arm64 x86_64; do
+    swift build -c release --triple "$ARCH-apple-macosx14.0"
+    SLICES+=("$(swift build -c release --triple "$ARCH-apple-macosx14.0" --show-bin-path)/Headroom")
+done
+BIN=.build/Headroom-universal
+lipo -create "${SLICES[@]}" -output "$BIN"
 
 APP=build/Headroom.app
 rm -rf "$APP"

@@ -18,6 +18,9 @@ enum Prefs {
     static let interval = "interval"
     static let awakeForAgents = "awake.agents"
     static let awakeDisplay = "awake.display"
+    /// AWS profile and comma-separated regions for Bedrock CloudWatch metrics; empty means auto-detect.
+    static let bedrockProfile = "bedrock.profile"
+    static let bedrockRegions = "bedrock.regions"
 
     static func register() {
         UserDefaults.standard.register(defaults: [
@@ -38,6 +41,7 @@ enum Palette {
     static let battery = NSColor(srgbRed: 0.98, green: 0.80, blue: 0.30, alpha: 1)
     static let claude = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
     static let grok = NSColor(srgbRed: 0.62, green: 0.66, blue: 0.74, alpha: 1)
+    static let bedrock = NSColor(srgbRed: 1.00, green: 0.60, blue: 0.00, alpha: 1)
 
     static func severity(_ pct: Double?, base: NSColor) -> NSColor {
         guard let pct else { return base }
@@ -80,6 +84,12 @@ final class Store: ObservableObject {
     @Published var grokPlan: GrokPlan?
     @Published var grokError: String?
     @Published var grokUsage: UsageSummary?
+    /// Account-wide Bedrock usage from CloudWatch, and the subset Claude Code logged locally.
+    @Published var bedrockCloud: BedrockUsage?
+    @Published var bedrockCloudUsage: UsageSummary?
+    @Published var bedrockLocalUsage: UsageSummary?
+    @Published var bedrockError: String?
+    @Published var bedrockConfig: BedrockConfig?
     @Published var indexing: String?
     @Published var usageUpdated: Date?
     /// Keep awake: end of the manual session (.distantFuture = indefinitely), and whether working agents hold it.
@@ -88,6 +98,14 @@ final class Store: ObservableObject {
     var awake: Bool { awakeUntil != nil || awakeForAgents }
 
     private var seq = 0
+
+    /// CloudWatch covers every Bedrock caller in the account, so it replaces the local logs whenever it has data.
+    var bedrockFromCloudWatch: Bool { (bedrockCloudUsage?.month.tokens ?? 0) > 0 }
+    var bedrockUsage: UsageSummary? {
+        if bedrockFromCloudWatch { return bedrockCloudUsage }
+        return (bedrockLocalUsage?.month.tokens ?? 0) > 0 ? bedrockLocalUsage : nil
+    }
+    var bedrockAvailable: Bool { bedrockUsage != nil || bedrockConfig?.explicit == true }
 
     func record(cpu c: CPUSample?, gpu g: Double?, memory m: MemSample?) {
         let now = Date()

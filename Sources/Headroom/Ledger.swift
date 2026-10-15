@@ -66,6 +66,7 @@ struct UsageSummary {
 
 extension UsageSummary {
     /// Adds two providers' summaries; the 5h window is Claude-only and comes from `a`.
+    /// Model ids must not overlap between the two (Bedrock rows are prefixed or region-qualified).
     static func combine(_ a: UsageSummary?, _ b: UsageSummary?) -> UsageSummary? {
         guard var r = a ?? b else { return nil }
         guard let a, let b else { return r }
@@ -116,7 +117,8 @@ final class Pricing {
         guard let (data, _) = try? await URLSession.shared.data(from: source),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         var t: [String: Price] = [:]
-        for (k, v) in json where k.hasPrefix("claude") {
+        // Bedrock ids (`anthropic.claude-...`, `au.anthropic.claude-...-v1:0`) carry regional prices.
+        for (k, v) in json where k.hasPrefix("claude") || k.contains("anthropic.claude") {
             guard let v = v as? [String: Any], let input = v.double("input_cost_per_token"),
                   let output = v.double("output_cost_per_token") else { continue }
             let write = v.double("cache_creation_input_token_cost") ?? input * 1.25
@@ -136,8 +138,13 @@ final class Pricing {
         let p: Price? = lock.withLock {
             if let hit = resolved[model] { return hit }
             var p = table[model]
+            // bedrock/claude-sonnet-5, au.anthropic.claude-haiku-4-5-20251001-v1:0 -> claude-...
+            var base = model.hasPrefix(Ledger.bedrockPrefix) ? String(model.dropFirst(Ledger.bedrockPrefix.count)) : model
+            if let r = base.range(of: "anthropic.") { base = String(base[r.upperBound...]) }
+            if let r = base.range(of: #"-v\d+(:\d+)?$"#, options: .regularExpression) { base = String(base[..<r.lowerBound]) }
+            if p == nil { p = table[base] }
             // claude-haiku-4-5-20251001 -> claude-haiku-4-5
-            if p == nil, let r = model.range(of: #"-\d{8}$"#, options: .regularExpression) { p = table[String(model[..<r.lowerBound])] }
+            if p == nil, let r = base.range(of: #"-\d{8}$"#, options: .regularExpression) { p = table[String(base[..<r.lowerBound])] }
             if !table.isEmpty { resolved[model] = p }
             return p
         }
@@ -152,12 +159,15 @@ final class Pricing {
 /// Incremental token ledger over Claude Code transcripts and Grok session usage files.
 /// Claude: tail-reads ~/.claude/projects/**/*.jsonl by byte offset, dedupes on message id + request id
 /// (same rule as ccusage), and buckets per hour and model. State is cached on disk so relaunches are instant.
+/// Turns Claude Code ran through AWS Bedrock (message ids `msg_bdrk_...`) are kept apart under `bedrock/<model>`.
 final class Ledger {
+    static let bedrockPrefix = "bedrock/"
+
     private struct FileMark: Codable { var offset: UInt64 }
     /// What has been counted for one message id + request id, per model.
     private struct Seen: Codable { var hour: Int; var parts: [String: Agg] }
     private struct State: Codable {
-        var version = 3
+        var version = 5
         var files: [String: FileMark] = [:]
         var seen: [String: Seen] = [:]
         var hours: [Int: [String: Agg]] = [:]
@@ -180,17 +190,42 @@ final class Ledger {
     private var lastActivity = Date.distantPast
     private var changeCounter = 0
     private var lastSummaryKey = ""
-    private var cachedSummaries: (UsageSummary, UsageSummary)?
+    private var cachedSummaries: (UsageSummary, UsageSummary, UsageSummary)?
     private let cacheFile = appSupportDir.appendingPathComponent("claude-ledger.json")
     private let usageNeedle = Array(#""usage":{"#.utf8)
 
+    /// Cowork session transcript folders, found on each full scan.
+    private var coworkRoots: [URL] = []
+
     private var claudeRoots: [URL] {
-        [homeDir.appendingPathComponent(".claude/projects"), homeDir.appendingPathComponent(".config/claude/projects")]
+        [homeDir.appendingPathComponent(".claude/projects"), homeDir.appendingPathComponent(".config/claude/projects")] + coworkRoots
+    }
+
+    /// The desktop app runs each Cowork session with its own Claude Code config folder under
+    /// local-agent-mode-sessions. Only its `.claude/projects` transcripts are read; the audit.jsonl next to them
+    /// repeats the same messages.
+    private static func findCoworkRoots() -> [URL] {
+        let fm = FileManager.default
+        var out: [URL] = []
+        func walk(_ dir: URL, depth: Int) {
+            let projects = dir.appendingPathComponent(".claude/projects")
+            if fm.fileExists(atPath: projects.path) { out.append(projects); return }
+            guard depth < 4, let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey],
+                                                                     options: [.skipsHiddenFiles]) else { return }
+            for item in items where (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true {
+                walk(item, depth: depth + 1)
+            }
+        }
+        for app in ["Claude", "Claude-3p"] {
+            walk(homeDir.appendingPathComponent("Library/Application Support/\(app)/local-agent-mode-sessions"), depth: 0)
+        }
+        return out
     }
 
     /// Scans for new data and returns summaries. `progress` reports indexing on first run.
     func refresh(windowStart: Date?, progress: @escaping (String?) -> Void,
-                 completion: @escaping (_ claude: UsageSummary, _ grok: UsageSummary, _ lastActivity: Date) -> Void) {
+                 completion: @escaping (_ claude: UsageSummary, _ grok: UsageSummary, _ bedrock: UsageSummary,
+                                        _ lastActivity: Date) -> Void) {
         queue.async { [self] in
             if !loaded { loadCache(); loaded = true }
             let full = Date().timeIntervalSince(lastFullScan) >= 300
@@ -211,10 +246,12 @@ final class Ledger {
             // Summaries only change with new data, a new window, or a new day.
             let key = "\(changeCounter)|\(windowStart?.timeIntervalSince1970 ?? 0)|\(Calendar.current.startOfDay(for: Date()).timeIntervalSince1970)"
             if key != lastSummaryKey || cachedSummaries == nil {
-                cachedSummaries = (summarize(claudeHours(), windowStart: windowStart), summarize(grokHours(), windowStart: nil))
+                cachedSummaries = (Self.summarize(claudeHours(bedrock: false), windowStart: windowStart),
+                                   Self.summarize(grokHours(), windowStart: nil),
+                                   Self.summarize(claudeHours(bedrock: true), windowStart: nil))
                 lastSummaryKey = key
             }
-            completion(cachedSummaries!.0, cachedSummaries!.1, lastActivity)
+            completion(cachedSummaries!.0, cachedSummaries!.1, cachedSummaries!.2, lastActivity)
         }
     }
 
@@ -231,6 +268,7 @@ final class Ledger {
         var present = Set<String>()
         var hot = Set<String>()
         let hotCutoff = Date().addingTimeInterval(-2 * 3600)
+        coworkRoots = Self.findCoworkRoots()
 
         for root in claudeRoots {
             guard let en = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else { continue }
@@ -344,13 +382,17 @@ final class Ledger {
             guard let sub = it.string("model"), sub != model, it.string("type") != "message" else { continue }
             parts[sub, default: Agg(calls: 0)].add(Self.agg(it))
         }
+        if msg.string("id")?.hasPrefix("msg_bdrk_") == true {
+            parts = Dictionary(uniqueKeysWithValues: parts.map { (Self.bedrockPrefix + $0.key, $0.value) })
+        }
 
-        guard let id = msg.string("id"), let req = obj.string("requestId") else {
+        guard let id = msg.string("id") else {
             for (m, a) in parts { state.hours[hour, default: [:]][m, default: Agg()].add(a) }
             changeCounter += 1
             return
         }
-        let key = id + ":" + req
+        // Bedrock and Cowork transcripts often omit the request id; the message id alone is still unique.
+        let key = id + ":" + (obj.string("requestId") ?? "")
         if var old = state.seen[key] {
             // Streaming logs the same message several times with growing counts; count only the growth.
             for (m, a) in parts {
@@ -384,7 +426,15 @@ final class Ledger {
         return a
     }
 
-    private func claudeHours() -> [Int: [String: Agg]] { state.hours }
+    /// Claude subscription/API turns, or only the ones Claude Code sent through Bedrock.
+    private func claudeHours(bedrock: Bool) -> [Int: [String: Agg]] {
+        var out: [Int: [String: Agg]] = [:]
+        for (h, byModel) in state.hours {
+            let picked = byModel.filter { $0.key.hasPrefix(Self.bedrockPrefix) == bedrock }
+            if !picked.isEmpty { out[h] = picked }
+        }
+        return out
+    }
 
     // MARK: Grok
 
@@ -439,7 +489,7 @@ final class Ledger {
     // MARK: Summaries
 
     /// Calendar-day windows like ccusage: today, the last 7 days and the last 30 days, all including today.
-    private func summarize(_ hours: [Int: [String: Agg]], windowStart: Date?) -> UsageSummary {
+    static func summarize(_ hours: [Int: [String: Agg]], windowStart: Date?) -> UsageSummary {
         let cal = Calendar.current
         let today = cal.startOfDay(for: Date())
         let weekStart = cal.date(byAdding: .day, value: -6, to: today)!
