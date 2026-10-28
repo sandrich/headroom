@@ -15,7 +15,8 @@ macOS menu bar app (Swift Package, AppKit + SwiftUI, Sparkle updates). Sources i
 2. Create the release with notes, which also creates the tag:
    `GH_TOKEN=$(gh auth token -u sandrich) gh release create vx.y --repo sandrich/headroom --target main --title "Headroom x.y" --notes-file notes.md`
 3. The Release workflow (`.github/workflows/release.yml`) builds, signs and notarizes the DMG, attaches it plus the Sparkle `appcast.xml`, and keeps the notes written at publish time. Pushing a tag `vx.y` without a release also works; then the notes are generated from the commits since the previous tag. Rebuild an existing release with the workflow's manual trigger and the tag.
-4. Notes format used so far: `## What's new` bullets, then `**Full changelog**: .../compare/vPREV...vNEW`, then `Universal build for Apple Silicon and Intel, macOS 14 or newer. Signed and notarized by Apple.`
+4. If the run fails with "The network connection was lost" from Apple's notary or ticket service, re-run it: `build.sh` retries those calls, and if the tag predates a fix, move the tag (`git tag -f vx.y <commit> && git push -f origin vx.y`) and the tag push rebuilds and re-attaches the assets while keeping the notes.
+5. Notes format used so far: `## What's new` bullets, then `**Full changelog**: .../compare/vPREV...vNEW`, then `Universal build for Apple Silicon and Intel, macOS 14 or newer. Signed and notarized by Apple.`
 
 `gh` defaults to an account without write access to this repo; always prefix with `GH_TOKEN=$(gh auth token -u sandrich)`. Git push over SSH works as is.
 
