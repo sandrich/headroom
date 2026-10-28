@@ -69,9 +69,11 @@ dmg)
     AUTH=()
     # Stapling fetches the ticket from Apple, which sometimes fails from CI runners. It only matters for a
     # first launch without network (Gatekeeper otherwise looks the ticket up online), so retry, then warn.
+    # Apple's notary and ticket services drop connections now and then; retry everything that talks to them.
+    retry() { for _ in 1 2 3 4 5; do "$@" && return 0; sleep 20; done; return 1; }
     STAPLED=1
     staple() {
-        for _ in 1 2 3 4 5; do xcrun stapler staple "$1" && return 0; sleep 20; done
+        retry xcrun stapler staple "$1" && return 0
         echo "warning: could not staple $1; notarized, but the first launch needs network" >&2
         STAPLED=0
     }
@@ -83,7 +85,7 @@ dmg)
     # (otherwise the first launch needs a network check). notarytool takes a zip, not a bundle.
     if [ ${#AUTH[@]} -gt 0 ]; then
         ditto -c -k --keepParent "$APP" build/Headroom.zip
-        xcrun notarytool submit build/Headroom.zip "${AUTH[@]}" --wait
+        retry xcrun notarytool submit build/Headroom.zip "${AUTH[@]}" --wait
         rm build/Headroom.zip
         staple "$APP"
     fi
@@ -103,9 +105,9 @@ dmg)
         echo "Signed $DMG (not notarized: no NOTARY_PROFILE or NOTARY_KEY)"
         exit 0
     fi
-    xcrun notarytool submit "$DMG" "${AUTH[@]}" --wait
+    retry xcrun notarytool submit "$DMG" "${AUTH[@]}" --wait
     staple "$DMG"
-    [ "$STAPLED" = 0 ] || xcrun stapler validate "$DMG"
+    [ "$STAPLED" = 0 ] || retry xcrun stapler validate "$DMG"
     spctl --assess --type open --context context:primary-signature --verbose "$DMG"
     echo "Notarized $DMG"
     ;;
