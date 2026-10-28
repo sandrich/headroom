@@ -176,11 +176,17 @@ final class Ledger {
         var files: [String: FileMark] = [:]
         var seen: [String: Seen] = [:]
         var hours: [Int: [String: Agg]] = [:]
+        // Added after version 5 as optionals, so an older cache still loads without a re-index.
+        var grok: [String: GrokFile]?
+        var codex: [String: CodexFile]?
+        var opencode: [String: CodexTurn]?
+        var opencodeUpdated: Int64?
     }
-    private struct GrokTurn { var key: String; var hour: Int; var model: String; var agg: Agg }
-    private struct GrokFile { var mtime: Date; var turns: [GrokTurn] }
-    struct CodexTurn { var key: String; var hour: Int; var model: String; var agg: Agg }
-    private struct CodexFile { var mtime: Date; var turns: [CodexTurn] }
+    private struct GrokTurn: Codable { var key: String; var hour: Int; var model: String; var agg: Agg }
+    private struct GrokFile: Codable { var mtime: Date; var turns: [GrokTurn] }
+    struct CodexTurn: Codable { var key: String; var hour: Int; var model: String; var agg: Agg }
+    private struct CodexFile: Codable { var offset: UInt64 = 0; var model = "gpt"; var turns: [CodexTurn] = [] }
+    private static let codexNeedles = [Array(#""turn_context""#.utf8), Array(#""token_usage_record""#.utf8)]
 
     static let retentionDays = 32
 
@@ -193,6 +199,9 @@ final class Ledger {
     private var codexFiles: [String: CodexFile] = [:]
     private var opencodeHours: [Int: [String: Agg]] = [:]
     private var opencodeStamp = Date.distantPast
+    /// OpenCode messages by id, read incrementally by time_updated; the hour buckets are rebuilt from them.
+    private var opencodeTurns: [String: CodexTurn] = [:]
+    private var opencodeUpdated: Int64 = 0
     /// Transcripts modified in the last two hours; tailed on every refresh between full scans.
     private var hotFiles: Set<String> = []
     private var lastFullScan = Date.distantPast
@@ -360,28 +369,38 @@ final class Ledger {
         }
     }
 
-    /// Reads complete lines from `offset` and returns the new offset (just past the last newline).
-    /// The file is memory-mapped, so even multi-hundred-megabyte transcripts are not copied into memory.
     private func ingestClaudeFile(_ path: String, from offset: UInt64) -> UInt64 {
+        Self.scanLines(path, from: offset) { line in
+            if Self.contains(line, usageNeedle) { ingestClaudeLine(Self.data(line)) }
+        }
+    }
+
+    /// Calls `body` with each complete line from `offset` and returns the new offset (just past the last newline).
+    /// The file is memory-mapped, so even multi-hundred-megabyte transcripts are not copied into memory.
+    static func scanLines(_ path: String, from offset: UInt64, _ body: (UnsafeRawBufferPointer) -> Void) -> UInt64 {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .alwaysMapped),
               UInt64(data.count) > offset else { return offset }
-        let consumed = data.withUnsafeBytes { raw -> Int in
-            guard let base = raw.baseAddress else { return Int(offset) }
+        return data.withUnsafeBytes { raw -> UInt64 in
+            guard let base = raw.baseAddress else { return offset }
             let n = raw.count
             var start = Int(offset)
             while start < n, let nl = memchr(base + start, 0x0A, n - start) {
                 let end = base.distance(to: UnsafeRawPointer(nl))
-                if end > start, memmem(base + start, end - start, usageNeedle, usageNeedle.count) != nil {
-                    autoreleasepool {
-                        ingestClaudeLine(Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: base + start),
-                                              count: end - start, deallocator: .none))
-                    }
-                }
+                if end > start { autoreleasepool { body(UnsafeRawBufferPointer(start: base + start, count: end - start)) } }
                 start = end + 1
             }
-            return start
+            return UInt64(start)
         }
-        return UInt64(consumed)
+    }
+
+    /// Cheap prefilter before parsing a line as JSON.
+    static func contains(_ line: UnsafeRawBufferPointer, _ needle: [UInt8]) -> Bool {
+        memmem(line.baseAddress, line.count, needle, needle.count) != nil
+    }
+
+    /// The line as Data without copying it out of the mapping; only valid while the file is being scanned.
+    static func data(_ line: UnsafeRawBufferPointer) -> Data {
+        Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: line.baseAddress!), count: line.count, deallocator: .none)
     }
 
     private func ingestClaudeLine(_ line: Data) {
@@ -471,6 +490,7 @@ final class Ledger {
                 if grokFiles[url.path]?.mtime == mtime { continue }
                 grokFiles[url.path] = GrokFile(mtime: mtime, turns: parseGrokUsage(url))
                 changeCounter += 1
+                dirty = true
             }
         }
         grokFiles = grokFiles.filter { present.contains($0.key) }
@@ -507,40 +527,45 @@ final class Ledger {
     // MARK: Codex
 
     /// Codex (CLI and the ChatGPT desktop app) writes one rollout per thread under ~/.codex/sessions/YYYY/MM/DD,
-    /// moved to archived_sessions when archived. Rollouts are re-parsed whenever their mtime changes.
+    /// moved to archived_sessions when archived. Rollouts are appended to, so only new bytes are read.
     private func scanCodex() {
         let cutoff = Date().addingTimeInterval(-Double(Self.retentionDays) * 86400)
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
         var present = Set<String>()
         for dir in ["sessions", "archived_sessions"] {
             let root = homeDir.appendingPathComponent(".codex/\(dir)")
-            guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { continue }
+            guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys) else { continue }
             for case let url as URL in files where url.pathExtension == "jsonl" {
-                guard let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+                guard let v = try? url.resourceValues(forKeys: Set(keys)), let mtime = v.contentModificationDate,
                       mtime >= cutoff else { continue }
                 present.insert(url.path)
                 lastActivity = max(lastActivity, mtime)
-                if codexFiles[url.path]?.mtime == mtime { continue }
-                codexFiles[url.path] = CodexFile(mtime: mtime, turns: Self.parseCodexRollout(url))
+                let size = UInt64(v.fileSize ?? 0)
+                var f = codexFiles[url.path] ?? CodexFile()
+                if f.offset == size { continue }
+                if size < f.offset { f = CodexFile() } // rewritten; dedupe keys prevent double counting
+                f.offset = Self.parseCodexRollout(url.path, from: f.offset, model: &f.model, into: &f.turns)
+                codexFiles[url.path] = f
                 changeCounter += 1
+                dirty = true
             }
         }
         codexFiles = codexFiles.filter { present.contains($0.key) }
     }
 
-    /// One `token_usage_record` per model response; the model comes from the preceding `turn_context`.
+    /// Appends one turn per `token_usage_record` found from `offset`; the model comes from the preceding
+    /// `turn_context`, carried in `model` across calls. Returns the new offset.
     /// `input_tokens` includes the cached part and `output_tokens` the reasoning part, as in the OpenAI API.
-    static func parseCodexRollout(_ url: URL) -> [CodexTurn] {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
-        var model = "gpt"
-        var turns: [CodexTurn] = []
-        for line in text.split(separator: "\n") {
+    static func parseCodexRollout(_ path: String, from offset: UInt64 = 0, model: inout String,
+                                  into turns: inout [CodexTurn]) -> UInt64 {
+        scanLines(path, from: offset) { line in
             // Cheap prefilter; most lines are messages and tool output.
-            guard line.contains("\"turn_context\"") || line.contains("\"token_usage_record\""),
-                  let o = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let p = o.dict("payload") else { continue }
-            if o.string("type") == "turn_context" { model = p.string("model") ?? model; continue }
+            guard codexNeedles.contains(where: { contains(line, $0) }),
+                  let o = try? JSONSerialization.jsonObject(with: data(line)) as? [String: Any],
+                  let p = o.dict("payload") else { return }
+            if o.string("type") == "turn_context" { model = p.string("model") ?? model; return }
             guard o.string("type") == "token_usage_record", let u = p.dict("usage"),
-                  let date = ISO.parse(o.string("timestamp")) else { continue }
+                  let date = ISO.parse(o.string("timestamp")) else { return }
             let cached = u.int("cached_input_tokens"), write = u.int("cache_write_input_tokens")
             let agg = Agg(input: max(u.int("input_tokens") - cached - write, 0), output: u.int("output_tokens"),
                           cacheWrite5m: write, cacheRead: cached, calls: 1)
@@ -548,16 +573,16 @@ final class Ledger {
             let key = p.string("response_id") ?? "\(o.string("timestamp") ?? "")|\(u.int("total_tokens"))"
             turns.append(CodexTurn(key: key, hour: Int(date.timeIntervalSince1970 / 3600), model: model, agg: agg))
         }
-        return turns
     }
 
-    private func codexHours() -> [Int: [String: Agg]] {
+    private func codexHours() -> [Int: [String: Agg]] { Self.bucket(codexFiles.values.flatMap(\.turns)) }
+
+    /// Hour and model buckets from turns, counting each key once (forked or resumed sessions repeat turns).
+    static func bucket(_ turns: some Sequence<CodexTurn>) -> [Int: [String: Agg]] {
         var seen = Set<String>()
         var hours: [Int: [String: Agg]] = [:]
-        for f in codexFiles.values {
-            for t in f.turns where seen.insert(t.key).inserted {
-                hours[t.hour, default: [:]][t.model, default: Agg()].add(t.agg)
-            }
+        for t in turns where seen.insert(t.key).inserted {
+            hours[t.hour, default: [:]][t.model, default: Agg()].add(t.agg)
         }
         return hours
     }
@@ -565,7 +590,7 @@ final class Ledger {
     // MARK: OpenCode
 
     /// OpenCode keeps every turn in SQLite (`session_message`, one row per message id, so no dedupe is needed).
-    /// The database is small enough to re-aggregate whenever it changes.
+    /// Only rows written since the last scan are read; a row carries the whole message, up to hundreds of MB.
     private func scanOpenCode() {
         let db = homeDir.appendingPathComponent(".local/share/opencode/opencode.db").path
         // Writes land in the WAL first, so its mtime is the one that moves.
@@ -574,43 +599,77 @@ final class Ledger {
         }.max() ?? .distantPast
         guard stamp != opencodeStamp else { return }
         let cutoff = Int64(Date().addingTimeInterval(-Double(Self.retentionDays) * 86400).timeIntervalSince1970 * 1000)
-        guard let rows = Self.queryOpenCode(db, since: cutoff) else { return }
+        guard let rows = Self.queryOpenCode(db, since: cutoff, updatedAfter: opencodeUpdated) else { return }
         opencodeStamp = stamp
-        opencodeHours = rows.hours
-        if let last = rows.last { lastActivity = max(lastActivity, last) }
+        for t in rows.turns { opencodeTurns[t.key] = t }
+        opencodeTurns = opencodeTurns.filter { $0.value.hour >= Int(cutoff / 3_600_000) }
+        opencodeHours = Self.bucket(opencodeTurns.values)
+        if rows.updated > 0 {
+            opencodeUpdated = max(opencodeUpdated, rows.updated)
+            lastActivity = max(lastActivity, Date(timeIntervalSince1970: Double(rows.updated) / 1000))
+        }
         changeCounter += 1
+        dirty = true
     }
 
-    /// nil when the database is missing or its layout changed (OpenCode has renamed tables before).
-    static func queryOpenCode(_ path: String, since: Int64) -> (hours: [Int: [String: Agg]], last: Date?)? {
+    /// Assistant messages created since `since` and updated at or after `updatedAfter` (both ms), keyed by id,
+    /// plus the newest time_updated seen. nil when the database is missing or its layout changed
+    /// (OpenCode has renamed tables before).
+    static func queryOpenCode(_ path: String, since: Int64, updatedAfter: Int64 = 0) -> (turns: [CodexTurn], updated: Int64)? {
         var handle: OpaquePointer?
         defer { sqlite3_close(handle) }
         guard sqlite3_open_v2(path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return nil }
         sqlite3_busy_timeout(handle, 500)
+        // json_extract would parse the whole row (gigabytes of memory for a 300 MB message) and even substr loads
+        // it whole, so the head (model) and the tail (tokens, the last key OpenCode writes) are read as blob ranges.
         let sql = """
-            SELECT time_created / 3600000, json_extract(data, '$.model.id'),
-                   sum(json_extract(data, '$.tokens.input')),
-                   sum(coalesce(json_extract(data, '$.tokens.output'), 0) + coalesce(json_extract(data, '$.tokens.reasoning'), 0)),
-                   sum(json_extract(data, '$.tokens.cache.write')), sum(json_extract(data, '$.tokens.cache.read')),
-                   count(*), max(time_updated)
+            SELECT rowid, id, time_created, time_updated
             FROM session_message
-            WHERE type = 'assistant' AND time_created >= ? AND json_extract(data, '$.tokens') IS NOT NULL
-            GROUP BY 1, 2
+            WHERE type = 'assistant' AND time_created >= ? AND time_updated >= ?
             """
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
         guard sqlite3_prepare_v2(handle, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
         sqlite3_bind_int64(stmt, 1, since)
-        var hours: [Int: [String: Agg]] = [:]
-        var last: Int64 = 0
+        sqlite3_bind_int64(stmt, 2, updatedAfter)
+        var turns: [CodexTurn] = []
+        var updated: Int64 = 0
         while sqlite3_step(stmt) == SQLITE_ROW {
-            func col(_ i: Int32) -> Int { Int(sqlite3_column_int64(stmt, i)) }
-            let model = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "opencode"
-            hours[col(0), default: [:]][model, default: Agg()].add(
-                Agg(input: col(2), output: col(3), cacheWrite5m: col(4), cacheRead: col(5), calls: col(6)))
-            last = max(last, sqlite3_column_int64(stmt, 7))
+            updated = max(updated, sqlite3_column_int64(stmt, 3))
+            var blob: OpaquePointer?
+            guard sqlite3_blob_open(handle, "main", "session_message", "data", sqlite3_column_int64(stmt, 0), 0, &blob) == SQLITE_OK
+            else { continue }
+            defer { sqlite3_blob_close(blob) }
+            let size = Int(sqlite3_blob_bytes(blob))
+            func read(_ from: Int, _ count: Int) -> String {
+                var buf = [UInt8](repeating: 0, count: count)
+                guard sqlite3_blob_read(blob, &buf, Int32(count), Int32(from)) == SQLITE_OK else { return "" }
+                return String(decoding: buf, as: UTF8.self)
+            }
+            guard let tokens = jsonObject(after: "\"tokens\":", in: read(max(size - 1024, 0), min(1024, size)), backwards: true)
+            else { continue }
+            let cache = tokens.dict("cache") ?? [:]
+            let id = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            turns.append(CodexTurn(key: id, hour: Int(sqlite3_column_int64(stmt, 2) / 3_600_000),
+                                   model: jsonObject(after: "\"model\":", in: read(0, min(512, size)))?.string("id") ?? "opencode",
+                                   agg: Agg(input: tokens.int("input"), output: tokens.int("output") + tokens.int("reasoning"),
+                                            cacheWrite5m: cache.int("write"), cacheRead: cache.int("read"), calls: 1)))
         }
-        return (hours, last > 0 ? Date(timeIntervalSince1970: Double(last) / 1000) : nil)
+        return (turns, updated)
+    }
+
+    /// The `{...}` object that follows `key` in a fragment of a larger JSON document.
+    static func jsonObject(after key: String, in fragment: String, backwards: Bool = false) -> [String: Any]? {
+        guard let r = fragment.range(of: key, options: backwards ? .backwards : []), fragment[r.upperBound...].first == "{"
+        else { return nil }
+        var depth = 0
+        // shortcut: braces inside string values are not skipped, which the model and tokens objects never contain.
+        for i in fragment[r.upperBound...].indices {
+            if fragment[i] == "{" { depth += 1 }
+            if fragment[i] == "}" { depth -= 1 }
+            if depth == 0 { return try? JSONSerialization.jsonObject(with: Data(fragment[r.upperBound...i].utf8)) as? [String: Any] }
+        }
+        return nil
     }
 
     // MARK: Summaries
@@ -665,9 +724,18 @@ final class Ledger {
         guard let data = try? Data(contentsOf: cacheFile),
               let s = try? JSONDecoder().decode(State.self, from: data), s.version == State().version else { return }
         state = s
+        grokFiles = s.grok ?? [:]
+        codexFiles = s.codex ?? [:]
+        opencodeTurns = s.opencode ?? [:]
+        opencodeUpdated = s.opencodeUpdated ?? 0
+        opencodeHours = Self.bucket(opencodeTurns.values)
     }
 
     private func saveCache() {
+        state.grok = grokFiles
+        state.codex = codexFiles
+        state.opencode = opencodeTurns
+        state.opencodeUpdated = opencodeUpdated
         guard let data = try? JSONEncoder().encode(state) else { return }
         try? data.write(to: cacheFile, options: .atomic)
         dirty = false

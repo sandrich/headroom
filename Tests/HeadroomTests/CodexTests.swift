@@ -34,13 +34,23 @@ struct CodexTests {
             record("resp_a", "2026-10-24T07:48:27.871Z"),
             #"{"timestamp":"2026-10-24T08:10:00.000Z","type":"turn_context","payload":{"model":"gpt-6-sol"}}"#,
             record("resp_b", "2026-10-24T08:10:01.000Z"),
-        ].joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        ].map { $0 + "\n" }.joined().write(to: url, atomically: true, encoding: .utf8)
 
-        let turns = Ledger.parseCodexRollout(url)
+        var model = "gpt"
+        var turns: [Ledger.CodexTurn] = []
+        var offset = Ledger.parseCodexRollout(url.path, model: &model, into: &turns)
         #expect(turns.map(\.key) == ["resp_a", "resp_b"])
         #expect(turns.map(\.model) == ["gpt-6-luna", "gpt-6-sol"])
         let a = turns[0].agg
         #expect(a.input == 200 && a.cacheRead == 800 && a.output == 50 && a.calls == 1)
         #expect(turns[1].hour - turns[0].hour == 1)
+
+        // Rollouts are appended to: only the new bytes are read, and the model carries over.
+        let more = (record("resp_c", "2026-10-24T08:20:00.000Z") + "\n").data(using: .utf8)!
+        let h = try FileHandle(forWritingTo: url)
+        h.seekToEndOfFile(); h.write(more); try h.close()
+        let size = try #require((try FileManager.default.attributesOfItem(atPath: url.path))[.size] as? UInt64)
+        offset = Ledger.parseCodexRollout(url.path, from: offset, model: &model, into: &turns)
+        #expect(turns.map(\.key) == ["resp_a", "resp_b", "resp_c"] && turns[2].model == "gpt-6-sol" && offset == size)
     }
 }
