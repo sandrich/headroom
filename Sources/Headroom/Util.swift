@@ -64,11 +64,38 @@ enum ISO {
     /// Parses ISO 8601 timestamps with any number of fractional digits and either Z or +hh:mm.
     static func parse(_ s: String?) -> Date? {
         guard let s, !s.isEmpty else { return nil }
-        if let d = frac.date(from: s) ?? plain.date(from: s) { return d }
+        if let d = fast(s) ?? frac.date(from: s) ?? plain.date(from: s) { return d }
         guard let dot = s.firstIndex(of: ".") else { return nil }
         let rest = s[s.index(after: dot)...]
         let end = rest.firstIndex(where: { !$0.isNumber }) ?? s.endIndex
         return plain.date(from: String(s[..<dot]) + String(s[end...]))
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS[.fff]Z`, the form every transcript writes; the formatter was 40% of a cold index.
+    static func fast(_ s: String) -> Date? {
+        let u = Array(s.utf8)
+        guard u.count >= 20, u[4] == 45, u[7] == 45, u[10] == 84, u[13] == 58, u[16] == 58, u[19] == (u.count == 20 ? 90 : 46),
+              u.last == 90 else { return nil }
+        func num(_ r: Range<Int>) -> Int? {
+            var v = 0
+            for c in u[r] { guard c >= 48, c <= 57 else { return nil }; v = v * 10 + Int(c - 48) }
+            return v
+        }
+        guard let y = num(0..<4), let mo = num(5..<7), let d = num(8..<10), let h = num(11..<13), let mi = num(14..<16),
+              let sec = num(17..<19), (1...12).contains(mo), (1...31).contains(d), h < 24, mi < 60, sec < 60 else { return nil }
+        var fraction = 0.0, scale = 0.1
+        for c in u[min(20, u.count - 1)..<(u.count - 1)] {
+            guard c >= 48, c <= 57 else { return nil }
+            fraction += Double(c - 48) * scale
+            scale /= 10
+        }
+        // Days since 1970-01-01 from the proleptic Gregorian calendar (Howard Hinnant's days_from_civil).
+        let yy = mo <= 2 ? y - 1 : y
+        let era = yy / 400
+        let yoe = yy - era * 400
+        let doy = (153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1
+        let days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468
+        return Date(timeIntervalSince1970: Double(days * 86400 + h * 3600 + mi * 60 + sec) + fraction)
     }
 }
 

@@ -52,6 +52,21 @@ struct ISOTests {
         #expect(ISO.parse("2026-10-13T10:00:00+02:00") == expected)
     }
 
+    @Test(arguments: ["2026-10-13T08:00:00Z", "2026-10-13T08:00:00.5Z", "2024-02-29T23:59:59.999Z", "1999-12-31T00:00:00.000Z",
+                      "2026-01-01T00:00:00.123456789Z", "2100-03-01T12:30:45Z"])
+    func fastPathMatchesTheFormatter(_ s: String) throws {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = s.contains(".") ? [.withInternetDateTime, .withFractionalSeconds] : [.withInternetDateTime]
+        let expected = try #require(f.date(from: s.replacingOccurrences(of: #"(\.\d{3})\d+"#, with: "$1", options: .regularExpression)))
+        let fast = try #require(ISO.fast(s))
+        #expect(abs(fast.timeIntervalSince(expected)) < 0.001)
+    }
+
+    @Test(arguments: ["2026-10-13T10:00:00+02:00", "2026-10-13T08:00:00", "2026-13-13T08:00:00Z", "2026-10-13T08:00:00.12xZ", "garbage"])
+    func fastPathRejectsOtherForms(_ s: String) {
+        #expect(ISO.fast(s) == nil)
+    }
+
     @Test func parsesLongFractions() throws {
         // Grok writes nanosecond fractions.
         let d = try #require(ISO.parse("2026-10-13T08:00:00.123456789Z"))
