@@ -185,7 +185,7 @@ final class Ledger {
     private struct GrokTurn: Codable { var key: String; var hour: Int; var model: String; var agg: Agg }
     private struct GrokFile: Codable { var mtime: Date; var turns: [GrokTurn] }
     struct CodexTurn: Codable { var key: String; var hour: Int; var model: String; var agg: Agg }
-    private struct CodexFile: Codable { var offset: UInt64 = 0; var model = "gpt"; var turns: [CodexTurn] = [] }
+    struct CodexFile: Codable { var offset: UInt64 = 0; var model = "gpt"; var turns: [CodexTurn] = [] }
     private static let codexNeedles = [Array(#""turn_context""#.utf8), Array(#""token_usage_record""#.utf8)]
 
     static let retentionDays = 32
@@ -204,6 +204,9 @@ final class Ledger {
     private var opencodeUpdated: Int64 = 0
     /// Transcripts modified in the last two hours; tailed on every refresh between full scans.
     private var hotFiles: Set<String> = []
+    /// Grok usage files and Codex rollouts to re-stat between full scans, like `hotFiles`.
+    private var grokHot: Set<String> = []
+    private var codexHot: Set<String> = []
     private var lastFullScan = Date.distantPast
     /// Newest transcript write seen (Claude, Grok, Codex or OpenCode), used to tell when an agent is working.
     private var lastActivity = Date.distantPast
@@ -251,15 +254,15 @@ final class Ledger {
             let full = Date().timeIntervalSince(lastFullScan) >= 300
             if full {
                 scanClaude(progress: progress)
-                scanGrok()
-                scanCodex()
+                scanGrok(full: true)
+                scanCodex(full: true)
                 scanOpenCode()
                 lastFullScan = Date()
             } else {
                 discoverNewFiles()
                 tailHotFiles()
-                scanGrok()
-                scanCodex()
+                scanGrok(full: false)
+                scanCodex(full: false)
                 scanOpenCode()
             }
             // Encoding the cache is the most expensive step, so only persist occasionally (and on quit).
@@ -475,25 +478,46 @@ final class Ledger {
 
     // MARK: Grok
 
-    private func scanGrok() {
+    /// Full: every session, and forgets removed ones. Otherwise only the hot usage files plus sessions that
+    /// appeared in project folders touched in the last two hours.
+    private func scanGrok(full: Bool) {
         let root = homeDir.appendingPathComponent(".grok/sessions")
-        guard let projects = try? FileManager.default.contentsOfDirectory(atPath: root.path) else { return }
-        var present = Set<String>()
+        let fm = FileManager.default
+        let hotCutoff = Date().addingTimeInterval(-2 * 3600)
+        func mtime(_ url: URL) -> Date? {
+            (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        }
+        guard let projects = try? fm.contentsOfDirectory(atPath: root.path) else { return }
+        var paths: [String] = []
         for p in projects {
             let dir = root.appendingPathComponent(p)
-            guard let sessions = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { continue }
+            // A folder's date moves when an entry is added, so untouched projects and sessions are skipped.
+            guard full || (mtime(dir) ?? .distantPast) >= hotCutoff,
+                  let sessions = try? fm.contentsOfDirectory(atPath: dir.path) else { continue }
             for s in sessions {
-                let url = dir.appendingPathComponent(s).appendingPathComponent("usage.json")
-                guard let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { continue }
-                present.insert(url.path)
-                lastActivity = max(lastActivity, mtime)
-                if grokFiles[url.path]?.mtime == mtime { continue }
-                grokFiles[url.path] = GrokFile(mtime: mtime, turns: parseGrokUsage(url))
-                changeCounter += 1
-                dirty = true
+                let session = dir.appendingPathComponent(s)
+                let path = session.appendingPathComponent("usage.json").path
+                if full {
+                    paths.append(path)
+                } else if !grokHot.contains(path), (mtime(session) ?? .distantPast) >= hotCutoff {
+                    grokHot.insert(path) // usage.json may not exist yet; it is picked up once it does
+                }
             }
         }
-        grokFiles = grokFiles.filter { present.contains($0.key) }
+        if full { grokHot = [] } else { paths = Array(grokHot) }
+        var present = Set<String>()
+        for path in paths {
+            let url = URL(fileURLWithPath: path)
+            guard let mtime = mtime(url) else { continue }
+            present.insert(path)
+            if mtime >= hotCutoff { grokHot.insert(path) }
+            lastActivity = max(lastActivity, mtime)
+            if grokFiles[path]?.mtime == mtime { continue }
+            grokFiles[path] = GrokFile(mtime: mtime, turns: parseGrokUsage(url))
+            changeCounter += 1
+            dirty = true
+        }
+        if full { grokFiles = grokFiles.filter { present.contains($0.key) } }
     }
 
     private func parseGrokUsage(_ url: URL) -> [GrokTurn] {
@@ -528,29 +552,63 @@ final class Ledger {
 
     /// Codex (CLI and the ChatGPT desktop app) writes one rollout per thread under ~/.codex/sessions/YYYY/MM/DD,
     /// moved to archived_sessions when archived. Rollouts are appended to, so only new bytes are read.
-    private func scanCodex() {
-        let cutoff = Date().addingTimeInterval(-Double(Self.retentionDays) * 86400)
+    private func scanCodex(full: Bool) {
+        let r = Self.scanCodex(root: homeDir.appendingPathComponent(".codex"), full: full, files: &codexFiles, hot: &codexHot)
+        lastActivity = max(lastActivity, r.newest)
+        if r.changed > 0 { changeCounter += r.changed; dirty = true }
+    }
+
+    /// One pass over `root` (~/.codex). Full: walks everything, rebuilds `hot` (modified in the last two hours)
+    /// and forgets removed or aged-out files. Otherwise only re-stats `hot` and lists the day folders of today
+    /// and yesterday for new rollouts. Returns how many files had new bytes and the newest write seen.
+    static func scanCodex(root: URL, full: Bool, now: Date = Date(), files: inout [String: CodexFile],
+                          hot: inout Set<String>) -> (changed: Int, newest: Date) {
+        let cutoff = now.addingTimeInterval(-Double(retentionDays) * 86400)
+        let hotCutoff = now.addingTimeInterval(-2 * 3600)
         let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        let fm = FileManager.default
         var present = Set<String>()
-        for dir in ["sessions", "archived_sessions"] {
-            let root = homeDir.appendingPathComponent(".codex/\(dir)")
-            guard let files = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys) else { continue }
-            for case let url as URL in files where url.pathExtension == "jsonl" {
-                guard let v = try? url.resourceValues(forKeys: Set(keys)), let mtime = v.contentModificationDate,
-                      mtime >= cutoff else { continue }
-                present.insert(url.path)
-                lastActivity = max(lastActivity, mtime)
-                let size = UInt64(v.fileSize ?? 0)
-                var f = codexFiles[url.path] ?? CodexFile()
-                if f.offset == size { continue }
-                if size < f.offset { f = CodexFile() } // rewritten; dedupe keys prevent double counting
-                f.offset = Self.parseCodexRollout(url.path, from: f.offset, model: &f.model, into: &f.turns)
-                codexFiles[url.path] = f
-                changeCounter += 1
-                dirty = true
+        var changed = 0
+        var newest = Date.distantPast
+        func visit(_ url: URL) {
+            guard let v = try? url.resourceValues(forKeys: Set(keys)), let mtime = v.contentModificationDate,
+                  mtime >= cutoff else { return }
+            present.insert(url.path)
+            if mtime >= hotCutoff { hot.insert(url.path) }
+            newest = max(newest, mtime)
+            let size = UInt64(v.fileSize ?? 0)
+            var f = files[url.path] ?? CodexFile()
+            if f.offset == size { return }
+            if size < f.offset { f = CodexFile() } // rewritten; dedupe keys prevent double counting
+            f.offset = parseCodexRollout(url.path, from: f.offset, model: &f.model, into: &f.turns)
+            files[url.path] = f
+            changed += 1
+        }
+        if full {
+            hot = []
+            for dir in ["sessions", "archived_sessions"] {
+                guard let en = fm.enumerator(at: root.appendingPathComponent(dir), includingPropertiesForKeys: keys) else { continue }
+                for case let url as URL in en where url.pathExtension == "jsonl" { visit(url) }
+            }
+            files = files.filter { present.contains($0.key) }
+        } else {
+            for path in hot { visit(URL(fileURLWithPath: path)) }
+            // Codex names the day folder by local date; UTC is covered too in case that ever differs.
+            let fmt = DateFormatter()
+            fmt.locale = Locale(identifier: "en_US_POSIX")
+            fmt.dateFormat = "yyyy/MM/dd"
+            var days = Set<String>()
+            for zone in [TimeZone.current, TimeZone(secondsFromGMT: 0)!] {
+                fmt.timeZone = zone
+                for d in [now, now.addingTimeInterval(-86400)] { days.insert(fmt.string(from: d)) }
+            }
+            for day in days {
+                let items = (try? fm.contentsOfDirectory(at: root.appendingPathComponent("sessions/\(day)"),
+                                                         includingPropertiesForKeys: keys)) ?? []
+                for url in items where url.pathExtension == "jsonl" && !hot.contains(url.path) { visit(url) }
             }
         }
-        codexFiles = codexFiles.filter { present.contains($0.key) }
+        return (changed, newest)
     }
 
     /// Appends one turn per `token_usage_record` found from `offset`; the model comes from the preceding

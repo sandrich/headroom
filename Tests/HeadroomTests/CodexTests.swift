@@ -53,4 +53,40 @@ struct CodexTests {
         offset = Ledger.parseCodexRollout(url.path, from: offset, model: &model, into: &turns)
         #expect(turns.map(\.key) == ["resp_a", "resp_b", "resp_c"] && turns[2].model == "gpt-6-sol" && offset == size)
     }
+
+    @Test func betweenFullScansOnlyHotAndTodaysRolloutsAreRead() throws {
+        let fm = FileManager.default
+        // Canonical (/private/var/...), so the paths from the directory walk and from the listing agree as they do under ~.
+        let tmp = try #require(try fm.temporaryDirectory.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath)
+        let root = URL(fileURLWithPath: tmp).appendingPathComponent("codex-\(UUID())")
+        defer { try? fm.removeItem(at: root) }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy/MM/dd"
+        let today = root.appendingPathComponent("sessions/\(fmt.string(from: Date()))")
+        let old = root.appendingPathComponent("sessions/2020/01/01")
+        for dir in [today, old] { try fm.createDirectory(at: dir, withIntermediateDirectories: true) }
+        func record(_ id: String) -> Data {
+            Data((#"{"timestamp":"2026-10-24T07:48:27.871Z","type":"token_usage_record","payload":{"response_id":"\#(id)","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}"# + "\n").utf8)
+        }
+        func keys(_ files: [String: Ledger.CodexFile]) -> [String] { files.values.flatMap(\.turns).map(\.key).sorted() }
+        let known = today.appendingPathComponent("known.jsonl")
+        try record("a").write(to: known)
+
+        var files: [String: Ledger.CodexFile] = [:]
+        var hot = Set<String>()
+        #expect(Ledger.scanCodex(root: root, full: true, files: &files, hot: &hot).changed == 1)
+        #expect(hot == [known.path] && keys(files) == ["a"])
+
+        let h = try FileHandle(forWritingTo: known)
+        h.seekToEndOfFile(); h.write(record("b")); try h.close()
+        try record("c").write(to: today.appendingPathComponent("new.jsonl"))
+        try record("d").write(to: old.appendingPathComponent("unseen.jsonl")) // only a full walk finds this one
+
+        let r = Ledger.scanCodex(root: root, full: false, files: &files, hot: &hot)
+        #expect(r.changed == 2 && keys(files) == ["a", "b", "c"] && hot.count == 2)
+        #expect(r.newest.timeIntervalSinceNow > -60)
+        #expect(Ledger.scanCodex(root: root, full: false, files: &files, hot: &hot).changed == 0)
+        #expect(Ledger.scanCodex(root: root, full: true, files: &files, hot: &hot).changed == 1)
+        #expect(keys(files) == ["a", "b", "c", "d"])
+    }
 }
