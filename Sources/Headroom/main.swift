@@ -52,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         startSampling()
         sample()
-        refreshLimits()
+        refreshLimits(all: true)
         refreshUsage()
         refreshBedrock()
         if snapshotDir == nil { updater.startUpdater() }
@@ -119,8 +119,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     // MARK: Limits and usage
 
-    private func refreshLimits(force: Bool = false) {
-        if force || Date() >= claudeBackoffUntil {
+    /// Fetches only what is visible: strip items that are enabled, or everything while the popover is open.
+    private func refreshLimits(force: Bool = false, all: Bool = false) {
+        let all = all || force || popover.isShown
+        if all || Prefs.bool(Prefs.showClaude), force || Date() >= claudeBackoffUntil {
             Task { @MainActor in
                 do {
                     store.claudeLimits = try await claudeClient.fetch()
@@ -134,6 +136,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     store.claudeError = error.localizedDescription
                     if case ClientError.http(429) = error { claudeBackoffUntil = Date().addingTimeInterval(300) }
                 }
+                // Extra logins are drawn only in the popover.
+                guard all else { return redraw() }
                 var extra: [ClaudeLimits] = []
                 for client in ClaudeLimitsClient.extraAccounts() {
                     do {
@@ -149,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 redraw()
             }
         }
-        Task { @MainActor in
+        if all || Prefs.bool(Prefs.showGrok) { Task { @MainActor in
             do {
                 store.grokPlan = try await grokClient.fetch()
                 store.grokError = nil
@@ -161,8 +165,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 store.grokError = error.localizedDescription
             }
             redraw()
-        }
-        Task { @MainActor in
+        } }
+        if all || Prefs.bool(Prefs.showCodex) { Task { @MainActor in
             do {
                 store.codexLimits = try await codexClient.fetch()
                 store.codexError = nil
@@ -175,7 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 store.codexError = error.localizedDescription
             }
             redraw()
-        }
+        } }
     }
 
     private func refreshUsage() {
@@ -295,6 +299,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         host.sizingOptions = .preferredContentSize
         popover.contentViewController = host
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        refreshLimits(all: true)
         NSApp.activate(ignoringOtherApps: true)
         // Without a key window the first click only focuses the popover and closes any menu it opened.
         host.view.window?.makeKey()
