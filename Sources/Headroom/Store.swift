@@ -77,6 +77,7 @@ final class Store: ObservableObject {
     @Published var cpu: CPUSample?
     @Published var cpuHistory: [Point] = []
     @Published var gpu: Double?
+    @Published var gpuSample: GPUSample?
     @Published var gpuHistory: [Point] = []
     @Published var memory: MemSample?
     @Published var memHistory: [Point] = []
@@ -124,11 +125,11 @@ final class Store: ObservableObject {
     }
     var bedrockAvailable: Bool { bedrockUsage != nil || bedrockConfig?.explicit == true }
 
-    func record(cpu c: CPUSample?, gpu g: Double?, memory m: MemSample?) {
+    func record(cpu c: CPUSample?, gpu g: GPUSample?, memory m: MemSample?) {
         let now = Date()
         seq += 1
         if let c { cpu = c; append(&cpuHistory, Point(id: seq, t: now, v: c.total)) }
-        if let g { gpu = g; append(&gpuHistory, Point(id: seq, t: now, v: g)) }
+        if let g { gpu = g.device; gpuSample = g; append(&gpuHistory, Point(id: seq, t: now, v: g.device)) }
         if let m { memory = m; append(&memHistory, Point(id: seq, t: now, v: m.percent)) }
     }
 

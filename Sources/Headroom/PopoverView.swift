@@ -289,8 +289,12 @@ struct SystemGrid: View {
                 }
                 .topConsumersOnHover(.cpu, title: "TOP CPU")
                 MetricCard(title: "GPU", icon: "cube.transparent", tint: .gpu, value: store.gpu, history: store.gpuHistory,
-                           subtitle: "Device utilization") { EmptyView() }
-                    .topConsumersOnHover(.gpu, title: "TOP GPU")
+                           subtitle: gpuSubtitle) {
+                    if let r = store.gpuSample?.renderer, let t = store.gpuSample?.tiler {
+                        GPUBars(renderer: r, tiler: t)
+                    }
+                }
+                .topConsumersOnHover(.gpu, title: "TOP GPU")
             }
             GridRow {
                 MetricCard(title: "Memory", icon: "memorychip", tint: memTint, value: store.memory?.percent,
@@ -310,6 +314,12 @@ struct SystemGrid: View {
                     .topConsumersOnHover(.battery, title: "ENERGY SHARE")
             }
         }
+    }
+
+    private var gpuSubtitle: String {
+        let g = store.gpuSample
+        let parts = [g?.cores.map { "\($0) cores" }, g?.memoryInUse.map(Fmt.gb)].compactMap { $0 }
+        return parts.isEmpty ? "Device utilization" : parts.joined(separator: " · ")
     }
 
     private var memTint: Color {
@@ -355,6 +365,33 @@ struct CoreBars: View {
                 }
                 .frame(height: 14)
             }
+        }
+    }
+}
+
+/// Renderer and tiler utilization, the only breakdown the GPU driver publishes (there is no per-core load).
+struct GPUBars: View {
+    let renderer: Double
+    let tiler: Double
+    var body: some View {
+        HStack(spacing: 8) {
+            bar("Render", renderer)
+            bar("Tiler", tiler)
+        }
+        .frame(height: 14)
+    }
+
+    private func bar(_ label: String, _ v: Double) -> some View {
+        HStack(spacing: 4) {
+            Text(label).font(.system(size: 9)).foregroundStyle(.secondary).fixedSize()
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 1).fill(Color.primary.opacity(0.08))
+                    RoundedRectangle(cornerRadius: 1).fill(Color.severity(v, base: .gpu))
+                        .frame(width: max(1, g.size.width * min(v, 100) / 100))
+                }
+            }
+            .frame(height: 4)
         }
     }
 }

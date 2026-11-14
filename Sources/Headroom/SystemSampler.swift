@@ -10,6 +10,15 @@ struct CPUSample {
     var cores: [Double]
 }
 
+/// macOS publishes no per-core GPU load, only the driver's device, renderer and tiler utilization.
+struct GPUSample {
+    var device: Double
+    var renderer: Double?
+    var tiler: Double?
+    var memoryInUse: UInt64?
+    var cores: Int?
+}
+
 struct MemSample {
     var used: UInt64
     var total: UInt64
@@ -44,6 +53,7 @@ struct BatterySample {
 final class SystemSampler {
     private var prevTicks: [[UInt32]] = []
     private var gpuEntry: io_registry_entry_t = 0
+    private var gpuCores: Int?
 
     deinit {
         if gpuEntry != 0 { IOObjectRelease(gpuEntry) }
@@ -122,7 +132,7 @@ final class SystemSampler {
 
     // MARK: GPU
 
-    func gpu() -> Double? {
+    func gpu() -> GPUSample? {
         if gpuEntry == 0 {
             var iter: io_iterator_t = 0
             guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iter) == KERN_SUCCESS else { return nil }
@@ -130,21 +140,28 @@ final class SystemSampler {
             while true {
                 let entry = IOIteratorNext(iter)
                 if entry == 0 { break }
-                if gpuEntry == 0, gpuUtilization(entry) != nil {
+                if gpuEntry == 0, gpuSample(entry) != nil {
                     gpuEntry = entry
+                    gpuCores = (IORegistryEntryCreateCFProperty(entry, "gpu-core-count" as CFString, kCFAllocatorDefault, 0)?
+                        .takeRetainedValue() as? NSNumber)?.intValue
                 } else {
                     IOObjectRelease(entry)
                 }
             }
         }
         guard gpuEntry != 0 else { return nil }
-        return gpuUtilization(gpuEntry)
+        return gpuSample(gpuEntry)
     }
 
-    private func gpuUtilization(_ entry: io_registry_entry_t) -> Double? {
+    private func gpuSample(_ entry: io_registry_entry_t) -> GPUSample? {
         guard let raw = IORegistryEntryCreateCFProperty(entry, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0)?
-            .takeRetainedValue(), let stats = raw as? [String: Any] else { return nil }
-        return (stats["Device Utilization %"] as? NSNumber)?.doubleValue
+            .takeRetainedValue(), let stats = raw as? [String: Any],
+              let device = (stats["Device Utilization %"] as? NSNumber)?.doubleValue else { return nil }
+        return GPUSample(device: device,
+                         renderer: (stats["Renderer Utilization %"] as? NSNumber)?.doubleValue,
+                         tiler: (stats["Tiler Utilization %"] as? NSNumber)?.doubleValue,
+                         memoryInUse: (stats["In use system memory"] as? NSNumber)?.uint64Value,
+                         cores: gpuCores)
     }
 
     // MARK: Battery
