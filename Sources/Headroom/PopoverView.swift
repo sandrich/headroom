@@ -1,5 +1,4 @@
 import SwiftUI
-import Charts
 import ServiceManagement
 
 extension Color {
@@ -108,33 +107,35 @@ struct BigNumber: View {
 }
 
 /// Live area chart with a fixed time window so it scrolls smoothly as samples arrive.
+/// Drawn with plain shapes: Swift Charts (and Canvas) hold about 200 MB of graphics memory while on screen.
 struct LiveChart: View {
     let points: [Point]
     let tint: Color
     var span: TimeInterval = 120
 
     var body: some View {
-        let end = points.last?.t ?? Date()
-        let start = end.addingTimeInterval(-span)
-        Chart(points.filter { $0.t >= start }) { p in
-            AreaMark(x: .value("t", p.t), y: .value("v", p.v))
-                .foregroundStyle(LinearGradient(colors: [tint.opacity(0.5), tint.opacity(0.02)], startPoint: .top, endPoint: .bottom))
-                .interpolationMethod(.monotone)
-            LineMark(x: .value("t", p.t), y: .value("v", p.v))
-                .foregroundStyle(tint)
-                .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
-                .interpolationMethod(.monotone)
-        }
-        .chartXScale(domain: start...end)
-        .chartYScale(domain: 0...100)
-        .chartXAxis(.hidden)
-        .chartPlotStyle { $0.clipped() }
-        .chartYAxis {
-            AxisMarks(values: [0, 50, 100]) { _ in
-                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3])).foregroundStyle(Color.primary.opacity(0.12))
+        GeometryReader { g in
+            let w = g.size.width, h = g.size.height
+            let start = (points.last?.t ?? Date()).addingTimeInterval(-span)
+            let pts = points.filter { $0.t >= start }.map {
+                CGPoint(x: w * $0.t.timeIntervalSince(start) / span, y: h * (1 - min(max($0.v, 0), 100) / 100))
+            }
+            Path { p in
+                for y in [0, h / 2, h] { p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: w, y: y)) }
+            }
+            .stroke(Color.primary.opacity(0.12), style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+            if let first = pts.first, let last = pts.last {
+                Path { p in
+                    p.addLines(pts)
+                    p.addLine(to: CGPoint(x: last.x, y: h))
+                    p.addLine(to: CGPoint(x: first.x, y: h))
+                    p.closeSubpath()
+                }
+                .fill(LinearGradient(colors: [tint.opacity(0.5), tint.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+                Path { $0.addLines(pts) }
+                    .stroke(tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
             }
         }
-        .animation(nil, value: points.count)
         .clipped()
     }
 }
@@ -242,35 +243,72 @@ struct DailyChart: View {
     let metric: DailyMetric
     var height: CGFloat = 110
 
+    private static let days = 30
     private var families: [String] { Array(Set(summary.bars.map(\.family))).sorted() }
+    private func color(_ family: String) -> Color { Palette.familyColor(family, index: families.firstIndex(of: family) ?? 0) }
+
+    /// Each bar's day index and its value range in that day's stack (bars come sorted by day and family).
+    private var segments: [(id: String, day: Int, lo: Double, hi: Double, family: String)] {
+        var top: [Int: Double] = [:]
+        return summary.bars.compactMap { b in
+            guard let d = Calendar.current.dateComponents([.day], from: summary.monthStart, to: b.day).day,
+                  (0..<Self.days).contains(d) else { return nil }
+            let lo = top[d, default: 0], hi = lo + (metric == .cost ? b.cost : Double(b.tokens) / 1e6)
+            top[d] = hi
+            return (b.id, d, lo, hi, b.family)
+        }
+    }
+
+    /// Smallest 1, 2 or 5 times a power of ten that is at least `v`; the spacing of the value axis.
+    static func niceStep(_ v: Double) -> Double {
+        guard v > 0 else { return 1 }
+        let mag = pow(10, floor(log10(v)))
+        return ([1, 2, 5].first { $0 * mag >= v } ?? 10) * mag
+    }
 
     var body: some View {
-        let today = Calendar.current.startOfDay(for: Date())
-        let end = Calendar.current.date(byAdding: .day, value: 1, to: today)!
-        Chart(summary.bars) { b in
-            BarMark(x: .value("Day", b.day, unit: .day),
-                    y: .value(metric.rawValue, metric == .cost ? b.cost : Double(b.tokens) / 1e6))
-                .foregroundStyle(by: .value("Model", b.family))
-                .cornerRadius(1.5)
-        }
-        .chartForegroundStyleScale(domain: families, range: families.enumerated().map { Palette.familyColor($1, index: $0) })
-        .chartXScale(domain: summary.monthStart...end)
-        .chartXAxis {
-            AxisMarks(values: (0..<4).compactMap { Calendar.current.date(byAdding: .day, value: $0 * 7, to: summary.monthStart) }) { _ in
-                AxisValueLabel(format: .dateTime.day().month(.abbreviated)).font(.system(size: 9))
+        let segs = segments
+        let peak = segs.map(\.hi).max() ?? 0
+        let step = Self.niceStep(peak / 3)
+        let lines = max(Int((peak / step).rounded(.up)), 1)
+        let top = step * Double(lines)
+        VStack(alignment: .leading, spacing: 6) {
+            GeometryReader { g in
+                // The value labels take 38 pt on the right, the date labels 14 pt at the bottom.
+                let plotW = g.size.width - 38, plotH = g.size.height - 14
+                let slot = plotW / CGFloat(Self.days)
+                ZStack(alignment: .topLeading) {
+                    ForEach(0...lines, id: \.self) { i in
+                        let y = plotH * (1 - CGFloat(i) / CGFloat(lines))
+                        Path { p in p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: plotW, y: y)) }
+                            .stroke(Color.primary.opacity(0.12), style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
+                        Text(metric == .cost ? Fmt.usd(step * Double(i)) : Fmt.tokens(Int(step * Double(i) * 1e6)))
+                            .lineLimit(1).frame(width: 34, alignment: .leading).position(x: plotW + 21, y: y)
+                    }
+                    ForEach(segs, id: \.id) { s in
+                        RoundedRectangle(cornerRadius: 1.5).fill(color(s.family))
+                            .frame(width: slot * 0.7, height: plotH * (s.hi - s.lo) / top)
+                            .offset(x: slot * (CGFloat(s.day) + 0.15), y: plotH * (1 - s.hi / top))
+                    }
+                    ForEach(0..<4, id: \.self) { i in
+                        if let d = Calendar.current.date(byAdding: .day, value: i * 7, to: summary.monthStart) {
+                            Text(d.formatted(.dateTime.day().month(.abbreviated))).fixedSize()
+                                .offset(x: slot * CGFloat(i * 7), y: plotH + 3)
+                        }
+                    }
+                }
+                .font(.system(size: 9)).foregroundStyle(.secondary)
             }
-        }
-        .chartYAxis {
-            AxisMarks(position: .trailing, values: .automatic(desiredCount: 3)) { v in
-                AxisGridLine(stroke: StrokeStyle(lineWidth: 0.5, dash: [2, 3])).foregroundStyle(Color.primary.opacity(0.12))
-                AxisValueLabel {
-                    if let d = v.as(Double.self) {
-                        Text(metric == .cost ? Fmt.usd(d) : "\(Fmt.tokens(Int(d * 1e6)))").font(.system(size: 9))
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 56), alignment: .leading)], alignment: .leading, spacing: 2) {
+                ForEach(families, id: \.self) { f in
+                    HStack(spacing: 4) {
+                        Circle().fill(color(f)).frame(width: 7, height: 7)
+                        Text(f).lineLimit(1)
                     }
                 }
             }
+            .font(.system(size: 10)).foregroundStyle(.secondary)
         }
-        .chartLegend(position: .bottom, alignment: .leading, spacing: 6)
         .frame(height: height)
     }
 }

@@ -10,6 +10,11 @@ struct FormattingTests {
         #expect(Fmt.tokens(n) == expected)
     }
 
+    @Test(arguments: [(0.0, 1.0), (7.3, 10.0), (11.0, 20.0), (0.03, 0.05), (2.0, 2.0), (600.0, 1000.0)])
+    func chartAxisStep(_ v: Double, _ expected: Double) {
+        #expect(abs(DailyChart.niceStep(v) - expected) < expected * 1e-9)
+    }
+
     @Test func usd() {
         #expect(Fmt.usd(nil) == "n/a")
         #expect(Fmt.usd(7.538) == "$7.54")
