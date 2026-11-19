@@ -58,7 +58,7 @@ struct StoreTests {
     @Test func historyIsCapped() {
         let store = Store()
         for i in 0..<(Store.historyLength + 20) {
-            store.record(cpu: CPUSample(total: Double(i), user: 0, system: 0, cores: []), gpu: nil, memory: nil)
+            store.record(cpu: CPUSample(total: Double(i), user: 0, system: 0, cores: []), gpu: nil, memory: nil, network: nil)
         }
         #expect(store.cpuHistory.count == Store.historyLength)
         #expect(store.cpuHistory.last?.v == Double(Store.historyLength + 19))

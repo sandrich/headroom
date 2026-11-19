@@ -2,6 +2,7 @@ import Foundation
 import Darwin
 import IOKit
 import IOKit.ps
+import SystemConfiguration
 
 struct CPUSample {
     var total: Double
@@ -49,11 +50,37 @@ struct BatterySample {
     var temperature: Double?
 }
 
-/// Sudo-free sampling of CPU, GPU, memory and battery via Mach and IOKit.
+/// Download and upload rates in bytes per second, and bytes moved since `since` (midnight, or launch on the first day).
+struct NetSample {
+    var down: Double
+    var up: Double
+    var totalDown: UInt64
+    var totalUp: UInt64
+    var since: Date
+}
+
+/// The interface macOS routes traffic through, e.g. en0 "Wi-Fi" 192.168.1.20.
+struct NetInterface: Equatable {
+    var name: String
+    var displayName: String?
+    var address: String?
+}
+
+struct NetCounter: Equatable {
+    var rx: UInt64
+    var tx: UInt64
+}
+
+/// Sudo-free sampling of CPU, GPU, memory, network and battery via Mach, sysctl and IOKit.
 final class SystemSampler {
     private var prevTicks: [[UInt32]] = []
     private var gpuEntry: io_registry_entry_t = 0
     private var gpuCores: Int?
+    private var prevNet: (time: TimeInterval, counters: [String: NetCounter])?
+    private var netTotal = NetCounter(rx: 0, tx: 0)
+    private var netSince = Date()
+    /// Localized interface names by BSD name; listing every interface is the costly part of networkInterface().
+    private var netDisplayNames: [String: String] = [:]
 
     deinit {
         if gpuEntry != 0 { IOObjectRelease(gpuEntry) }
@@ -162,6 +189,100 @@ final class SystemSampler {
                          tiler: (stats["Tiler Utilization %"] as? NSNumber)?.doubleValue,
                          memoryInUse: (stats["In use system memory"] as? NSNumber)?.uint64Value,
                          cores: gpuCores)
+    }
+
+    // MARK: Network
+
+    func network() -> NetSample? {
+        guard let counters = Self.interfaceCounters() else { return nil }
+        // A clock that keeps running during sleep, so bytes moved in dark wakes spread over the whole sleep, not one tick.
+        let now = Double(clock_gettime_nsec_np(CLOCK_MONOTONIC)) / 1e9
+        defer { prevNet = (now, counters) }
+        guard let prev = prevNet, now > prev.time else { return nil }
+        let d = Self.netDelta(from: prev.counters, to: counters)
+        // Any change of calendar day resets, also backwards after a time zone change.
+        if !Calendar.current.isDate(netSince, inSameDayAs: Date()) {
+            netTotal = NetCounter(rx: 0, tx: 0)
+            netSince = Calendar.current.startOfDay(for: Date())
+        }
+        netTotal.rx &+= d.rx
+        netTotal.tx &+= d.tx
+        let secs = now - prev.time
+        return NetSample(down: Double(d.rx) / secs, up: Double(d.tx) / secs, totalDown: netTotal.rx, totalUp: netTotal.tx,
+                         since: netSince)
+    }
+
+    /// Bytes moved per interface between two readings. A counter that went down (interface reset, wake) counts as 0.
+    static func netDelta(from prev: [String: NetCounter], to cur: [String: NetCounter]) -> NetCounter {
+        var d = NetCounter(rx: 0, tx: 0)
+        for (name, c) in cur {
+            guard let p = prev[name] else { continue }
+            if c.rx >= p.rx { d.rx += c.rx - p.rx }
+            if c.tx >= p.tx { d.tx += c.tx - p.tx }
+        }
+        return d
+    }
+
+    /// 64-bit byte counters of the en* interfaces that are up (Wi-Fi, Ethernet, USB and Thunderbolt adapters).
+    /// VPN tunnels, loopback, AWDL and bridges are left out: their traffic also passes an en* interface or never leaves the Mac.
+    /// getifaddrs only has 32-bit counters, which wrap at 4 GB, so this reads the routing socket's if_msghdr2 records.
+    static func interfaceCounters() -> [String: NetCounter]? {
+        var mib: [Int32] = [CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0]
+        var len = 0
+        guard sysctl(&mib, u_int(mib.count), nil, &len, nil, 0) == 0, len > 0 else { return nil }
+        var buf = [UInt8](repeating: 0, count: len)
+        guard sysctl(&mib, u_int(mib.count), &buf, &len, nil, 0) == 0 else { return nil }
+
+        var result: [String: NetCounter] = [:]
+        var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+        buf.withUnsafeBytes { raw in
+            var off = 0
+            while off + MemoryLayout<if_msghdr>.size <= len {
+                let hdr = raw.loadUnaligned(fromByteOffset: off, as: if_msghdr.self)
+                guard hdr.ifm_msglen > 0 else { break }
+                if Int32(hdr.ifm_type) == RTM_IFINFO2, off + MemoryLayout<if_msghdr2>.size <= len {
+                    let m = raw.loadUnaligned(fromByteOffset: off, as: if_msghdr2.self)
+                    if m.ifm_flags & IFF_UP != 0, if_indextoname(UInt32(m.ifm_index), &name) != nil {
+                        let n = String(cString: name)
+                        if n.hasPrefix("en") { result[n] = NetCounter(rx: m.ifm_data.ifi_ibytes, tx: m.ifm_data.ifi_obytes) }
+                    }
+                }
+                off += Int(hdr.ifm_msglen)
+            }
+        }
+        return result
+    }
+
+    /// The primary interface with its localized name and IPv4 address (IPv6-only networks have a name but no address).
+    func networkInterface() -> NetInterface? {
+        let primary = ["IPv4", "IPv6"].lazy.compactMap {
+            (SCDynamicStoreCopyValue(nil, "State:/Network/Global/\($0)" as CFString) as? [String: Any])?.string("PrimaryInterface")
+        }.first
+        guard let name = primary else { return nil }
+        if netDisplayNames[name] == nil {
+            let all = SCNetworkInterfaceCopyAll() as? [SCNetworkInterface] ?? []
+            netDisplayNames[name] = all.first { SCNetworkInterfaceGetBSDName($0) as String? == name }
+                .flatMap { SCNetworkInterfaceGetLocalizedDisplayName($0) as String? } ?? name
+        }
+        let display = netDisplayNames[name]
+
+        var address: String?
+        var addrs: UnsafeMutablePointer<ifaddrs>?
+        if getifaddrs(&addrs) == 0 {
+            defer { freeifaddrs(addrs) }
+            var p = addrs
+            while let a = p {
+                defer { p = a.pointee.ifa_next }
+                guard String(cString: a.pointee.ifa_name) == name, let sa = a.pointee.ifa_addr,
+                      sa.pointee.sa_family == UInt8(AF_INET) else { continue }
+                var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(sa, socklen_t(sa.pointee.sa_len), &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST) == 0 {
+                    address = String(cString: host)
+                    break
+                }
+            }
+        }
+        return NetInterface(name: name, displayName: display, address: address)
     }
 
     // MARK: Battery

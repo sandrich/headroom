@@ -3,7 +3,7 @@ import Darwin
 import IOKit
 
 enum SegmentKind {
-    case cpu, gpu, memory, battery, claude, grok, codex, awake
+    case cpu, gpu, memory, battery, network, claude, grok, codex, awake
 }
 
 struct Consumer: Identifiable {
@@ -16,6 +16,7 @@ struct Consumer: Identifiable {
 /// Per-app resource use straight from the kernel (libproc rusage) and the GPU driver's per-client
 /// accounting in the IORegistry. Only runs while a hover panel is visible.
 /// Helper processes are folded into their owning .app; root-owned daemons are not readable without sudo.
+/// Network has no per-process kernel counter outside a private framework, so it comes from nettop.
 final class ConsumerSampler {
     private struct Snapshot {
         var time: UInt64 = 0
@@ -32,13 +33,26 @@ final class ConsumerSampler {
         return (UInt64(tb.numer), UInt64(tb.denom))
     }()
 
+    // nettop runs on a background queue; everything below is only touched on the main thread.
+    private var netPrev: (time: UInt64, bytes: [pid_t: UInt64])?
+    private var netTop: [Consumer] = []
+    private var netBusy = false
+    private var netGeneration = 0
+
     func reset() {
         previous = nil
         names = [:]
+        netPrev = nil
+        netTop = []
+        netGeneration += 1
     }
 
     /// Top consumers for `kind`. Rates need two samples, so the first call for CPU/GPU/battery returns [].
     func top(_ kind: SegmentKind, limit: Int = 6) -> [Consumer] {
+        if kind == .network {
+            sampleNetwork(limit: limit)
+            return netTop
+        }
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
         var snap = Snapshot(time: mach_absolute_time())
@@ -63,7 +77,7 @@ final class ConsumerSampler {
             for (pid, bytes) in footprint { totals[name(pid), default: 0] += Double(bytes) }
         case .cpu, .gpu, .battery:
             guard let prev = previous, snap.time > prev.time else { return [] }
-            let wallNs = Double(snap.time - prev.time) * Double(timebase.numer) / Double(timebase.denom)
+            let wallNs = nanoseconds(snap.time - prev.time)
             let (now, before) = kind == .cpu ? (snap.cpu, prev.cpu) : kind == .gpu ? (snap.gpu, prev.gpu) : (snap.energy, prev.energy)
             for (pid, v) in now {
                 guard let old = before[pid], v > old else { continue }
@@ -84,13 +98,69 @@ final class ConsumerSampler {
             guard sum > 0 else { return [] }
             totals = totals.mapValues { $0 / sum * 100 }
         }
-        return totals.sorted { $0.value > $1.value }.prefix(limit).map { n, v in
+        return ranked(totals, limit) { v in
             switch kind {
-            case .memory: return Consumer(name: n, value: v, label: Fmt.gb(UInt64(v)))
-            case .battery: return Consumer(name: n, value: v, label: String(format: "%.0f%%", v))
-            default: return Consumer(name: n, value: v, label: String(format: "%.1f%%", v))
+            case .memory: return Fmt.gb(UInt64(v))
+            case .battery: return String(format: "%.0f%%", v)
+            default: return String(format: "%.1f%%", v)
             }
         }
+    }
+
+    private func nanoseconds(_ ticks: UInt64) -> Double {
+        Double(ticks) * Double(timebase.numer) / Double(timebase.denom)
+    }
+
+    private func ranked(_ totals: [String: Double], _ limit: Int, label: (Double) -> String) -> [Consumer] {
+        totals.sorted { $0.value > $1.value }.prefix(limit).map { Consumer(name: $0.key, value: $0.value, label: label($0.value)) }
+    }
+
+    /// Starts a nettop run unless one is in flight; its rates show up on the next call.
+    private func sampleNetwork(limit: Int) {
+        guard !netBusy else { return }
+        netBusy = true
+        let generation = netGeneration
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            // -t external leaves out loopback, so local dev servers and proxies do not count.
+            let out = runProcess("/usr/bin/nettop", ["-P", "-L", "1", "-n", "-x", "-t", "external", "-J", "bytes_in,bytes_out"],
+                                 timeout: 5)
+            // A run killed by the timeout can end mid-line, and a cut count would read as a burst on the next run.
+            let bytes = out.flatMap { $0.status == 0 ? Self.parseNettop(String(decoding: $0.output, as: UTF8.self)) : nil } ?? [:]
+            let time = mach_absolute_time()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.netBusy = false
+                guard generation == self.netGeneration, !bytes.isEmpty else { return }
+                defer { self.netPrev = (time, bytes) }
+                guard let prev = self.netPrev, time > prev.time else { return }
+                let secs = self.nanoseconds(time - prev.time) / 1e9
+                var totals: [String: Double] = [:]
+                for (pid, b) in bytes {
+                    // Totals drop when sockets close, so only growth counts.
+                    guard let old = prev.bytes[pid], b > old else { continue }
+                    totals[self.name(pid), default: 0] += Double(b - old) / secs
+                }
+                // An idle network has no rows; say so instead of leaving "Sampling..." up.
+                self.netTop = totals.isEmpty ? [Consumer(name: "No traffic", value: 0, label: "")]
+                    : self.ranked(totals, limit, label: Fmt.rate)
+            }
+        }
+    }
+
+    /// Bytes in plus out per pid from `nettop -P -L 1 -x -J bytes_in,bytes_out` lines like "Safari.812,1234,567,".
+    /// Process names can hold dots and commas, so fields are taken from the right.
+    static func parseNettop(_ csv: String) -> [pid_t: UInt64] {
+        var result: [pid_t: UInt64] = [:]
+        for line in csv.split(whereSeparator: \.isNewline) {
+            var fields = line.split(separator: ",", omittingEmptySubsequences: false)
+            if fields.last?.isEmpty == true { fields.removeLast() }
+            guard fields.count >= 3, let bytesOut = UInt64(fields[fields.count - 1]),
+                  let bytesIn = UInt64(fields[fields.count - 2]) else { continue }
+            let id = fields[..<(fields.count - 2)].joined(separator: ",")
+            guard let dot = id.lastIndex(of: "."), let pid = pid_t(id[id.index(after: dot)...]), pid > 0 else { continue }
+            result[pid, default: 0] &+= bytesIn &+ bytesOut
+        }
+        return result
     }
 
     /// Accumulated GPU nanoseconds per pid from the AGX driver's user clients.

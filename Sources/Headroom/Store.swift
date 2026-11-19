@@ -13,6 +13,7 @@ enum Prefs {
     static let showGPU = "show.gpu"
     static let showMem = "show.mem"
     static let showBattery = "show.battery"
+    static let showNet = "show.net"
     static let showClaude = "show.claude"
     static let showGrok = "show.grok"
     static let showCodex = "show.codex"
@@ -27,7 +28,7 @@ enum Prefs {
 
     static func register() {
         UserDefaults.standard.register(defaults: [
-            showCPU: true, showGPU: false, showMem: true, showBattery: false,
+            showCPU: true, showGPU: false, showMem: true, showBattery: false, showNet: false,
             showClaude: true, showGrok: true, showCodex: true, colorMenuBar: false, interval: 1.0,
             awakeForAgents: false, awakeDisplay: false,
         ])
@@ -42,6 +43,8 @@ enum Palette {
     static let gpu = NSColor(srgbRed: 0.69, green: 0.52, blue: 1.00, alpha: 1)
     static let mem = NSColor(srgbRed: 0.36, green: 0.85, blue: 0.60, alpha: 1)
     static let battery = NSColor(srgbRed: 0.98, green: 0.80, blue: 0.30, alpha: 1)
+    static let netDown = NSColor(srgbRed: 0.40, green: 0.58, blue: 1.00, alpha: 1)
+    static let netUp = NSColor(srgbRed: 0.96, green: 0.45, blue: 0.55, alpha: 1)
     static let claude = NSColor(srgbRed: 0.85, green: 0.47, blue: 0.34, alpha: 1)
     static let grok = NSColor(srgbRed: 0.62, green: 0.66, blue: 0.74, alpha: 1)
     static let bedrock = NSColor(srgbRed: 1.00, green: 0.60, blue: 0.00, alpha: 1)
@@ -82,6 +85,10 @@ final class Store: ObservableObject {
     @Published var memory: MemSample?
     @Published var memHistory: [Point] = []
     @Published var battery: BatterySample?
+    @Published var net: NetSample?
+    @Published var netDownHistory: [Point] = []
+    @Published var netUpHistory: [Point] = []
+    @Published var netInterface: NetInterface?
 
     @Published var claudeLimits: ClaudeLimits?
     @Published var claudeError: String?
@@ -125,12 +132,17 @@ final class Store: ObservableObject {
     }
     var bedrockAvailable: Bool { bedrockUsage != nil || bedrockConfig?.explicit == true }
 
-    func record(cpu c: CPUSample?, gpu g: GPUSample?, memory m: MemSample?) {
+    func record(cpu c: CPUSample?, gpu g: GPUSample?, memory m: MemSample?, network n: NetSample?) {
         let now = Date()
         seq += 1
         if let c { cpu = c; append(&cpuHistory, Point(id: seq, t: now, v: c.total)) }
         if let g { gpu = g.device; gpuSample = g; append(&gpuHistory, Point(id: seq, t: now, v: g.device)) }
         if let m { memory = m; append(&memHistory, Point(id: seq, t: now, v: m.percent)) }
+        if let n {
+            net = n
+            append(&netDownHistory, Point(id: seq, t: now, v: n.down))
+            append(&netUpHistory, Point(id: seq, t: now, v: n.up))
+        }
     }
 
     private func append(_ arr: inout [Point], _ p: Point) {

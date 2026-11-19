@@ -6,6 +6,8 @@ extension Color {
     static let gpu = Color(nsColor: Palette.gpu)
     static let mem = Color(nsColor: Palette.mem)
     static let battery = Color(nsColor: Palette.battery)
+    static let netDown = Color(nsColor: Palette.netDown)
+    static let netUp = Color(nsColor: Palette.netUp)
     static let claude = Color(nsColor: Palette.claude)
     static let grok = Color(nsColor: Palette.grok)
     static let bedrock = Color(nsColor: Palette.bedrock)
@@ -95,45 +97,76 @@ struct CardHeader: View {
     }
 }
 
+extension View {
+    /// The slot right of a card title. Its content sits at the bottom of a fixed 27 pt height, and the title's baseline
+    /// is pinned 5 pt above that bottom, where a 22 pt number has its baseline. So the title stays put whatever the slot
+    /// shows: a big number scaled down to fit, or two smaller lines.
+    func numberSlot() -> some View {
+        frame(height: 27, alignment: .bottom)
+            .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 5 }
+            .layoutPriority(1)
+    }
+}
+
 struct BigNumber: View {
     let text: String
     var color: Color = .primary
     var body: some View {
         // Laid out before the card title and scaled down only when "BATTERY 100%" would not fit.
         Text(text).font(.system(size: 22, weight: .semibold, design: .rounded)).monospacedDigit()
-            .lineLimit(1).minimumScaleFactor(0.75).layoutPriority(1)
+            .lineLimit(1).minimumScaleFactor(0.75)
             .foregroundStyle(color).contentTransition(.numericText())
+            .numberSlot()
     }
 }
 
 /// Live area chart with a fixed time window so it scrolls smoothly as samples arrive.
 /// Drawn with plain shapes: Swift Charts (and Canvas) hold about 200 MB of graphics memory while on screen.
 struct LiveChart: View {
-    let points: [Point]
-    let tint: Color
-    var span: TimeInterval = 120
+    /// Seconds shown, for callers that scale to the visible points.
+    static let span: TimeInterval = 120
+    /// Drawn in order, later series over earlier ones.
+    let series: [(points: [Point], tint: Color)]
+    /// The value drawn at the top edge: 100 for percentages, or nil to scale to the visible peak.
+    var top: Double? = 100
+    /// Smallest top when scaling to the peak, so idle chatter does not fill the chart.
+    var minTop: Double = 0
+
+    init(points: [Point], tint: Color) { series = [(points, tint)] }
+    init(series: [(points: [Point], tint: Color)], minTop: Double) {
+        self.series = series
+        top = nil
+        self.minTop = minTop
+    }
 
     var body: some View {
+        // Window from the newest sample of any series; each series is filtered once for both the scale and the drawing.
+        let start = (series.compactMap { $0.points.last?.t }.max() ?? Date()).addingTimeInterval(-Self.span)
+        let visible = series.map { $0.points.filter { $0.t >= start } }
+        // Auto scale rounds the peak up to 1, 2 or 5 times a power of ten, so it only changes when the peak crosses a step.
+        let top = top ?? DailyChart.niceStep(max(visible.joined().map(\.v).max() ?? 0, minTop))
         GeometryReader { g in
-            let w = g.size.width, h = g.size.height
-            let start = (points.last?.t ?? Date()).addingTimeInterval(-span)
-            let pts = points.filter { $0.t >= start }.map {
-                CGPoint(x: w * $0.t.timeIntervalSince(start) / span, y: h * (1 - min(max($0.v, 0), 100) / 100))
-            }
+            let w = g.size.width, h = g.size.height, span = Self.span
             Path { p in
                 for y in [0, h / 2, h] { p.move(to: CGPoint(x: 0, y: y)); p.addLine(to: CGPoint(x: w, y: y)) }
             }
             .stroke(Color.primary.opacity(0.12), style: StrokeStyle(lineWidth: 0.5, dash: [2, 3]))
-            if let first = pts.first, let last = pts.last {
-                Path { p in
-                    p.addLines(pts)
-                    p.addLine(to: CGPoint(x: last.x, y: h))
-                    p.addLine(to: CGPoint(x: first.x, y: h))
-                    p.closeSubpath()
+            ForEach(series.indices, id: \.self) { i in
+                let tint = series[i].tint
+                let pts = visible[i].map {
+                    CGPoint(x: w * $0.t.timeIntervalSince(start) / span, y: h * (1 - min(max($0.v, 0), top) / top))
                 }
-                .fill(LinearGradient(colors: [tint.opacity(0.5), tint.opacity(0.02)], startPoint: .top, endPoint: .bottom))
-                Path { $0.addLines(pts) }
-                    .stroke(tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                if let first = pts.first, let last = pts.last {
+                    Path { p in
+                        p.addLines(pts)
+                        p.addLine(to: CGPoint(x: last.x, y: h))
+                        p.addLine(to: CGPoint(x: first.x, y: h))
+                        p.closeSubpath()
+                    }
+                    .fill(LinearGradient(colors: [tint.opacity(0.5), tint.opacity(0.02)], startPoint: .top, endPoint: .bottom))
+                    Path { $0.addLines(pts) }
+                        .stroke(tint, style: StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+                }
             }
         }
         .clipped()
@@ -351,6 +384,10 @@ struct SystemGrid: View {
                 BatteryCard(battery: store.battery)
                     .topConsumersOnHover(.battery, title: "ENERGY SHARE")
             }
+            GridRow {
+                NetworkCard(store: store)
+                    .topConsumersOnHover(.network, title: "TOP NETWORK")
+            }
         }
     }
 
@@ -388,6 +425,55 @@ struct MetricCard<Extra: View>: View {
         .padding(10)
         .frame(width: 160, height: 150, alignment: .topLeading)
         .background(CardBackground())
+    }
+}
+
+/// Download and upload on one chart, scaled to the busier of the two over the visible window.
+struct NetworkCard: View {
+    @ObservedObject var store: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 2) {
+                CardHeader(title: "Network", icon: "network", tint: .netDown)
+                // Upload over download, right-aligned where the other cards show their percentage.
+                VStack(alignment: .trailing, spacing: 0) {
+                    speed("arrow.up", store.net?.up, .netUp)
+                    speed("arrow.down", store.net?.down, .netDown)
+                }
+                .numberSlot()
+            }
+            LiveChart(series: [(store.netDownHistory, .netDown), (store.netUpHistory, .netUp)], minTop: 10_240)
+                .frame(height: 42)
+            Text(interface).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            Text(store.net.map { "\(totalsLabel($0.since)) \u{2193} \(Fmt.bytes(Double($0.totalDown)))  \u{2191} \(Fmt.bytes(Double($0.totalUp)))" } ?? " ")
+                .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).minimumScaleFactor(0.8)
+        }
+        .padding(10)
+        .frame(width: 160, height: 150, alignment: .topLeading)
+        .background(CardBackground())
+    }
+
+    private func speed(_ icon: String, _ v: Double?, _ tint: Color) -> some View {
+        // A fixed size with no scaling: 10 pt is the largest that fits "888 MB/s" next to the title in a 160 pt card.
+        // Fixed width with the arrow pinned left and the value right-aligned, so neither moves as values change.
+        HStack(spacing: 0) {
+            Image(systemName: icon).font(.system(size: 8, weight: .bold)).foregroundStyle(tint)
+            Spacer(minLength: 1)
+            Text(v.map(Fmt.rate) ?? "--").font(.system(size: 10, weight: .semibold, design: .rounded)).monospacedDigit()
+                .lineLimit(1).fixedSize()
+        }
+        .frame(width: 58)
+    }
+
+    /// Totals reset at midnight; on the day Headroom started they count from launch.
+    private func totalsLabel(_ since: Date) -> String {
+        since == Calendar.current.startOfDay(for: since) ? "Today" : "Since \(since.formatted(date: .omitted, time: .shortened))"
+    }
+
+    private var interface: String {
+        guard let i = store.netInterface else { return "Not connected" }
+        return [i.displayName ?? i.name, i.address].compactMap { $0 }.joined(separator: " \u{00B7} ")
     }
 }
 
@@ -709,6 +795,7 @@ struct Footer: View {
     @AppStorage(Prefs.showGPU) private var showGPU = false
     @AppStorage(Prefs.showMem) private var showMem = true
     @AppStorage(Prefs.showBattery) private var showBattery = false
+    @AppStorage(Prefs.showNet) private var showNet = false
     @AppStorage(Prefs.showClaude) private var showClaude = true
     @AppStorage(Prefs.showGrok) private var showGrok = true
     @AppStorage(Prefs.showCodex) private var showCodex = true
@@ -726,6 +813,7 @@ struct Footer: View {
                     Toggle("GPU", isOn: $showGPU)
                     Toggle("Memory", isOn: $showMem)
                     Toggle("Battery", isOn: $showBattery)
+                    Toggle("Network", isOn: $showNet)
                     if store.claudeAvailable { Toggle("Claude limits", isOn: $showClaude) }
                     if store.grokAvailable { Toggle("Grok credits", isOn: $showGrok) }
                     if store.codexAvailable { Toggle("Codex limits", isOn: $showCodex) }
