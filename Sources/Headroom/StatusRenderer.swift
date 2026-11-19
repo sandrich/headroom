@@ -33,6 +33,9 @@ enum StatusRenderer {
         if Prefs.bool(Prefs.showMem) {
             add(.memory, metric(symbol: "memorychip", fallback: "MEM", tint: Palette.mem, value: store.memory?.percent, history: nil))
         }
+        if Prefs.bool(Prefs.showNet) {
+            add(.network, network(store.net))
+        }
         if Prefs.bool(Prefs.showBattery), let b = store.battery {
             add(.battery, battery(b))
         }
@@ -171,6 +174,26 @@ enum StatusRenderer {
             }
         })
         return row([glyph, value(b.percent, warn: false)], spacing: 3)
+    }
+
+    private static let smallFont = NSFont.monospacedDigitSystemFont(ofSize: 9, weight: .medium)
+    private static let netArrowWidth = ceil(["\u{2191}", "\u{2193}"].map { text($0, smallFont).size().width }.max() ?? 0) + 2
+    private static let netValueWidth = ["888 KB/s", "888 MB/s", "888 GB/s"].map { ceil(text($0, smallFont).size().width) }.max() ?? 0
+
+    /// Symbol plus upload over download in two small lines. Arrows stay at the left edge and values are right-aligned
+    /// in a column sized for the widest value, so neither moves as the numbers change.
+    private static func network(_ n: NetSample?) -> Segment {
+        let arrows = [text("\u{2191}", smallFont, color: tint(Palette.netUp)), text("\u{2193}", smallFont, color: tint(Palette.netDown))]
+        let values = [text(n.map { Fmt.rate($0.up) } ?? "--", smallFont), text(n.map { Fmt.rate($0.down) } ?? "--", smallFont)]
+        let w = netArrowWidth + netValueWidth
+        let lines: Segment = (w, { x in
+            let h = values[0].size().height
+            for (i, y) in [height / 2 - 1.5, height / 2 - h + 1.5].enumerated() {
+                arrows[i].draw(at: NSPoint(x: x, y: y))
+                values[i].draw(at: NSPoint(x: x + w - values[i].size().width, y: y))
+            }
+        })
+        return row([icon("network", "NET", tint: Palette.netDown), lines], spacing: 3)
     }
 
     /// Symbol plus one slim vertical gauge per value (Claude: 5h, week, model; Grok: credits).

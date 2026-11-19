@@ -15,6 +15,7 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("IOKit"),
                 .linkedFramework("ServiceManagement"),
+                .linkedFramework("SystemConfiguration"),
                 // Sparkle.framework: in Contents/Frameworks of the app, next to the binary in .build for dev runs.
                 .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@executable_path/../Frameworks",
                               "-Xlinker", "-rpath", "-Xlinker", "@executable_path"]),

@@ -95,7 +95,7 @@ final class HoverController: NSResponder {
         }
         position(panel, for: kind)
         timer?.invalidate()
-        if [.cpu, .gpu, .battery, .memory].contains(kind) {
+        if [.cpu, .gpu, .battery, .memory, .network].contains(kind) {
             // First rate sample after 0.5s, then refresh while visible; the panel resizes as rows change.
             let refresh = { [weak self] in
                 guard let self, self.current == kind, let panel = self.panel else { return }
@@ -175,6 +175,7 @@ struct HoverView: View {
         case .gpu: return "TOP GPU"
         case .memory: return "TOP MEMORY"
         case .battery: return "ENERGY SHARE"
+        case .network: return "TOP NETWORK"
         case .claude: return "CLAUDE LIMITS"
         case .grok: return "GROK CREDITS"
         case .codex: return "CODEX LIMITS"

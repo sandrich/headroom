@@ -97,12 +97,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func sample() {
-        store.record(cpu: sampler.cpu(), gpu: sampler.gpu(), memory: sampler.memory())
+        store.record(cpu: sampler.cpu(), gpu: sampler.gpu(), memory: sampler.memory(), network: sampler.network())
         // Battery changes slowly and reading the smart battery registry is the costliest probe.
         if tick % max(1, Int(5 / currentInterval)) == 0 { store.battery = sampler.battery() }
+        // The interface name and address are only shown in the dashboard.
+        if popover.isShown, tick % max(1, Int(10 / currentInterval)) == 0 { refreshNetInterface() }
         tick += 1
         syncAwake()
         redraw()
+    }
+
+    private func refreshNetInterface() {
+        let i = sampler.networkInterface()
+        if store.netInterface != i { store.netInterface = i }
     }
 
     private func redraw() {
@@ -285,6 +292,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
         hover?.hide()
+        refreshNetInterface()
         let view = PopoverView(store: store, actions: PopoverActions(
             refresh: { [weak self] in
                 self?.refreshLimits(force: true)
@@ -336,6 +344,7 @@ extension AppDelegate: SPUStandardUserDriverDelegate {
 extension AppDelegate {
     @MainActor fileprivate func writeSnapshots() {
         guard let dir = snapshotDir else { return }
+        refreshNetInterface()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var strip = NSImage()
         for (name, appearance) in [("light", NSAppearance.Name.aqua), ("dark", .darkAqua)] {

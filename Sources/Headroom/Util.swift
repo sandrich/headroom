@@ -20,6 +20,18 @@ enum Fmt {
         String(format: "%.1f GB", Double(b) / 1_073_741_824)
     }
 
+    /// Binary units (1 KB = 1024 bytes) like `gb` and the memory card, two significant digits below 10:
+    /// "0 KB", "8.4 KB", "340 KB", "1.2 GB".
+    static func bytes(_ b: Double) -> String {
+        let units = ["KB", "MB", "GB", "TB"]
+        var v = max(b, 0) / 1024, i = 0
+        while i < units.count - 1, v >= 999.5 { v /= 1024; i += 1 }
+        if v < 0.05 { return "0 \(units[i])" }
+        return String(format: v < 9.95 ? "%.1f %@" : "%.0f %@", v, units[i])
+    }
+
+    static func rate(_ bytesPerSecond: Double) -> String { bytes(bytesPerSecond) + "/s" }
+
     static func pct(_ v: Double?) -> String {
         guard let v else { return "--" }
         return "\(Int(v.rounded()))%"
