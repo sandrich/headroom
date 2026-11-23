@@ -547,6 +547,8 @@ struct LimitsCard: View {
                 CardHeader(title: "Codex", icon: "chevron.left.forwardslash.chevron.right", tint: .codex, trailing: store.codexLimits?.plan)
                 if let l = store.codexLimits {
                     ForEach(l.all) { LimitRow(entry: $0, tint: .codex) }
+                    if let s = l.spend { LimitRow(entry: s, tint: .codex) }
+                    if let c = l.credits { Text(c).font(.system(size: 10)).foregroundStyle(.secondary) }
                 } else {
                     Text(store.codexError ?? "Loading limits...").font(.system(size: 11)).foregroundStyle(.secondary)
                 }

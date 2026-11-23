@@ -309,6 +309,10 @@ final class GrokClient {
 struct CodexLimits {
     var all: [LimitEntry]
     var plan: String?
+    /// Workspace spend limit set by an admin, nil when there is none.
+    var spend: LimitEntry?
+    /// Prepaid credits left, e.g. "120 credits left", nil without credits.
+    var credits: String?
     var fetchedAt: Date
 }
 
@@ -332,7 +336,24 @@ final class CodexClient {
             return LimitEntry(id: id, name: windowName(window), percent: w.double("used_percent") ?? 0,
                               resetsAt: w.double("reset_at").map { Date(timeIntervalSince1970: $0) }, window: window)
         }
-        return CodexLimits(all: all, plan: json.string("plan_type")?.capitalized, fetchedAt: now)
+        return CodexLimits(all: all, plan: json.string("plan_type")?.capitalized, spend: parseSpend(json),
+                           credits: parseCredits(json), fetchedAt: now)
+    }
+
+    /// `spend_control.individual_limit` only reports the share left, not amounts.
+    static func parseSpend(_ json: [String: Any]) -> LimitEntry? {
+        guard let sc = json.dict("spend_control"), let l = sc.dict("individual_limit"),
+              let left = l.double("remaining_percent") else { return nil }
+        let reached = sc["reached"] as? Bool == true || l["reached"] as? Bool == true
+        return LimitEntry(id: "spend", name: "Spend limit", percent: reached ? 100 : min(100, max(0, 100 - left)),
+                          resetsAt: l.double("reset_at").map { Date(timeIntervalSince1970: $0) })
+    }
+
+    /// `credits.balance` comes as a string or a number.
+    static func parseCredits(_ json: [String: Any]) -> String? {
+        guard let c = json.dict("credits"), c["has_credits"] as? Bool == true, c["unlimited"] as? Bool != true else { return nil }
+        guard let balance = c.double("balance") ?? c.string("balance").flatMap(Double.init) else { return nil }
+        return "\(balance.rounded() == balance ? String(Int(balance)) : String(format: "%.2f", balance)) credits left"
     }
 
     /// Paid plans have a 5h and a weekly window, the free plan a single 30-day one.
