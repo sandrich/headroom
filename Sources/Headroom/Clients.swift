@@ -19,6 +19,8 @@ struct ClaudeLimits {
     var model: LimitEntry?
     var all: [LimitEntry]
     var plan: String?
+    /// Extra usage credits bought on top of the plan, nil when the account has no spend limit.
+    var spend: LimitEntry?
     var fetchedAt: Date
     /// Label of an extra Claude Code login, nil for the default one.
     var account: String?
@@ -180,7 +182,45 @@ final class ClaudeLimitsClient {
             result.weekly = e
             result.all.append(e)
         }
+        result.spend = Self.parseSpend(json)
         return result
+    }
+
+    /// A spend limit in either response shape. Amounts are in major units.
+    private struct RawSpend {
+        var spent: Double?, limit: Double?, percent: Double?, currency: String?, enabled = false
+    }
+
+    /// Extra usage credits, from `spend` or the older `extra_usage`. Shown only when there is a limit above zero.
+    static func parseSpend(_ json: [String: Any]) -> LimitEntry? {
+        guard let raw = json.dict("spend").map(rawSpend) ?? json.dict("extra_usage").map(rawExtraUsage),
+              let limit = raw.limit, limit > 0,
+              let percent = raw.spent.map({ $0 / limit * 100 }) ?? raw.percent else { return nil }
+        let code = raw.currency.flatMap { $0.isEmpty ? nil : $0 } ?? "USD"
+        func money(_ v: Double) -> String { Fmt.money(v, currency: code) }
+        var note = raw.spent.map { "\(money($0)) of \(money(limit))" } ?? "\(money(limit)) limit"
+        if !raw.enabled { note += ", turned off" }
+        return LimitEntry(id: "spend", name: "Usage credits", percent: min(100, max(0, percent)), note: note)
+    }
+
+    /// `spend`: each amount is a plain number or {amount_minor, exponent, currency}.
+    private static func rawSpend(_ s: [String: Any]) -> RawSpend {
+        func amount(_ v: Any?) -> (value: Double, currency: String?)? {
+            if let n = v as? NSNumber { return (n.doubleValue, nil) }
+            guard let d = v as? [String: Any], let minor = d.double("amount_minor") else { return nil }
+            return (minor / pow(10, d.double("exponent") ?? 2), d.string("currency"))
+        }
+        let used = amount(s["used"]), limit = amount(s["limit"]) ?? amount(s.dict("cap")?["money"])
+        return RawSpend(spent: used?.value, limit: limit?.value, percent: s.double("percent"),
+                        currency: used?.currency ?? limit?.currency, enabled: s["enabled"] as? Bool ?? false)
+    }
+
+    /// `extra_usage`: integers in minor units.
+    private static func rawExtraUsage(_ e: [String: Any]) -> RawSpend {
+        let scale = pow(10, e.double("decimal_places") ?? 2)
+        return RawSpend(spent: e.double("used_credits").map { $0 / scale }, limit: e.double("monthly_limit").map { $0 / scale },
+                        percent: e.double("utilization"), currency: e.string("currency")?.trimmingCharacters(in: .whitespaces),
+                        enabled: e["is_enabled"] as? Bool ?? false)
     }
 }
 

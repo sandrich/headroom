@@ -511,6 +511,8 @@ struct LimitsCard: View {
                     ForEach(rows.indices, id: \.self) { r in
                         LimitRow(bars: rows[r].map { ($0.entry, tint($0.account)) })
                     }
+                    let spend = spendBars([l] + store.claudeExtra)
+                    if !spend.isEmpty { LimitRow(bars: spend) }
                 } else {
                     Text(store.claudeError ?? "Loading limits...").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
@@ -558,6 +560,13 @@ struct LimitsCard: View {
         }
         .padding(12)
         .background(CardBackground())
+    }
+
+    /// LimitRow shows only the first entry's note, so with several accounts it carries every account's amounts.
+    private func spendBars(_ accounts: [ClaudeLimits]) -> [(entry: LimitEntry, tint: Color)] {
+        var bars: [(entry: LimitEntry, tint: Color)] = accounts.enumerated().compactMap { i, a in a.spend.map { ($0, tint(i)) } }
+        if bars.count > 1 { bars[0].entry.note = bars.compactMap(\.entry.note).joined(separator: " · ") }
+        return bars
     }
 
     private func window(_ p: GrokPlan) -> TimeInterval? {
