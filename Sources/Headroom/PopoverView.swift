@@ -504,20 +504,24 @@ struct LimitsCard: View {
             if store.claudeAvailable {
                 CardHeader(title: "Claude Code", icon: "sparkle", tint: .claude, trailing: store.claudeLimits?.plan,
                            badges: store.claudeExtra.enumerated().map { i, l in
-                               ([l.account, l.plan].compactMap { $0 }.joined(separator: " · "), tint(i + 1))
+                               ([l.account, l.plan].compactMap { $0 }.joined(separator: " · "), tint(i + (store.claudeLimits == nil ? 0 : 1)))
                            })
-                if let l = store.claudeLimits {
-                    let rows = limitRows([l] + store.claudeExtra)
+                // A failing default login still leaves the extra accounts' bars.
+                let accounts = [store.claudeLimits].compactMap { $0 } + store.claudeExtra
+                if !accounts.isEmpty {
+                    let rows = limitRows(accounts)
                     ForEach(rows.indices, id: \.self) { r in
                         LimitRow(bars: rows[r].map { ($0.entry, tint($0.account)) })
                     }
-                    let spend = spendBars([l] + store.claudeExtra)
+                    let spend = spendBars(accounts)
                     if !spend.isEmpty { LimitRow(bars: spend) }
                 } else {
                     Text(store.claudeError ?? "Loading limits...").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 if let err = store.claudeError, store.claudeLimits != nil {
                     Text("\(err), showing data from \(Fmt.ago(store.claudeLimits?.fetchedAt))").font(.system(size: 10)).foregroundStyle(.orange)
+                } else if let err = store.claudeError, !store.claudeExtra.isEmpty {
+                    Text("Default login: \(err)").font(.system(size: 10)).foregroundStyle(.orange)
                 }
             }
             if store.claudeAvailable && store.grokAvailable {

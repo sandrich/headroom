@@ -150,6 +150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     }
                 }
                 store.claudeExtra = extra
+                if !extra.isEmpty { store.claudeAvailable = true }
                 redraw()
             }
         }
