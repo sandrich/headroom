@@ -32,7 +32,9 @@ One compact, native-looking item in the menu bar. Click it for a dashboard with 
 **Dashboard**
 - Live charts for CPU (with per-core bars), GPU and memory; battery state, power draw, health and cycles
 - Claude Code plan limits with reset countdowns and a pace marker (where you would be if usage were spread evenly)
+- Claude Code usage credits: the extra usage spent of the monthly limit, for each account
 - Grok weekly credits
+- Codex plan limits, including the workspace spend limit and prepaid credits when the plan has them
 - AWS Bedrock: account-wide Claude tokens and estimated cost from CloudWatch, or, without AWS access, the Claude Code sessions that ran through Bedrock
 - Combined token usage for Claude Code, Grok and Bedrock: today, last 7 days, last 30 days, tokens and cost, a 30-day chart by model family, and a per-model table, similar to [ccusage](https://github.com/ryoppippi/ccusage)
 

@@ -19,6 +19,8 @@ struct ClaudeLimits {
     var model: LimitEntry?
     var all: [LimitEntry]
     var plan: String?
+    /// Extra usage credits bought on top of the plan, nil when the account has no spend limit.
+    var spend: LimitEntry?
     var fetchedAt: Date
     /// Label of an extra Claude Code login, nil for the default one.
     var account: String?
@@ -180,7 +182,45 @@ final class ClaudeLimitsClient {
             result.weekly = e
             result.all.append(e)
         }
+        result.spend = Self.parseSpend(json)
         return result
+    }
+
+    /// A spend limit in either response shape. Amounts are in major units.
+    private struct RawSpend {
+        var spent: Double?, limit: Double?, percent: Double?, currency: String?, enabled = false
+    }
+
+    /// Extra usage credits, from `spend` or the older `extra_usage`. Shown only when there is a limit above zero.
+    static func parseSpend(_ json: [String: Any]) -> LimitEntry? {
+        guard let raw = json.dict("spend").map(rawSpend) ?? json.dict("extra_usage").map(rawExtraUsage),
+              let limit = raw.limit, limit > 0,
+              let percent = raw.spent.map({ $0 / limit * 100 }) ?? raw.percent else { return nil }
+        let code = raw.currency.flatMap { $0.isEmpty ? nil : $0 } ?? "USD"
+        func money(_ v: Double) -> String { Fmt.money(v, currency: code) }
+        var note = raw.spent.map { "\(money($0)) of \(money(limit))" } ?? "\(money(limit)) limit"
+        if !raw.enabled { note += ", turned off" }
+        return LimitEntry(id: "spend", name: "Usage credits", percent: min(100, max(0, percent)), note: note)
+    }
+
+    /// `spend`: each amount is a plain number or {amount_minor, exponent, currency}.
+    private static func rawSpend(_ s: [String: Any]) -> RawSpend {
+        func amount(_ v: Any?) -> (value: Double, currency: String?)? {
+            if let n = v as? NSNumber { return (n.doubleValue, nil) }
+            guard let d = v as? [String: Any], let minor = d.double("amount_minor") else { return nil }
+            return (minor / pow(10, d.double("exponent") ?? 2), d.string("currency"))
+        }
+        let used = amount(s["used"]), limit = amount(s["limit"]) ?? amount(s.dict("cap")?["money"])
+        return RawSpend(spent: used?.value, limit: limit?.value, percent: s.double("percent"),
+                        currency: used?.currency ?? limit?.currency, enabled: s["enabled"] as? Bool ?? false)
+    }
+
+    /// `extra_usage`: integers in minor units.
+    private static func rawExtraUsage(_ e: [String: Any]) -> RawSpend {
+        let scale = pow(10, e.double("decimal_places") ?? 2)
+        return RawSpend(spent: e.double("used_credits").map { $0 / scale }, limit: e.double("monthly_limit").map { $0 / scale },
+                        percent: e.double("utilization"), currency: e.string("currency")?.trimmingCharacters(in: .whitespaces),
+                        enabled: e["is_enabled"] as? Bool ?? false)
     }
 }
 
@@ -269,6 +309,10 @@ final class GrokClient {
 struct CodexLimits {
     var all: [LimitEntry]
     var plan: String?
+    /// Workspace spend limit set by an admin, nil when there is none.
+    var spend: LimitEntry?
+    /// Prepaid credits left, e.g. "120 credits left", nil without credits.
+    var credits: String?
     var fetchedAt: Date
 }
 
@@ -292,7 +336,24 @@ final class CodexClient {
             return LimitEntry(id: id, name: windowName(window), percent: w.double("used_percent") ?? 0,
                               resetsAt: w.double("reset_at").map { Date(timeIntervalSince1970: $0) }, window: window)
         }
-        return CodexLimits(all: all, plan: json.string("plan_type")?.capitalized, fetchedAt: now)
+        return CodexLimits(all: all, plan: json.string("plan_type")?.capitalized, spend: parseSpend(json),
+                           credits: parseCredits(json), fetchedAt: now)
+    }
+
+    /// `spend_control.individual_limit` only reports the share left, not amounts.
+    static func parseSpend(_ json: [String: Any]) -> LimitEntry? {
+        guard let sc = json.dict("spend_control"), let l = sc.dict("individual_limit"),
+              let left = l.double("remaining_percent") else { return nil }
+        let reached = sc["reached"] as? Bool == true || l["reached"] as? Bool == true
+        return LimitEntry(id: "spend", name: "Spend limit", percent: reached ? 100 : min(100, max(0, 100 - left)),
+                          resetsAt: l.double("reset_at").map { Date(timeIntervalSince1970: $0) })
+    }
+
+    /// `credits.balance` comes as a string or a number.
+    static func parseCredits(_ json: [String: Any]) -> String? {
+        guard let c = json.dict("credits"), c["has_credits"] as? Bool == true, c["unlimited"] as? Bool != true else { return nil }
+        guard let balance = c.double("balance") ?? c.string("balance").flatMap(Double.init) else { return nil }
+        return "\(balance.rounded() == balance ? String(Int(balance)) : String(format: "%.2f", balance)) credits left"
     }
 
     /// Paid plans have a 5h and a weekly window, the free plan a single 30-day one.

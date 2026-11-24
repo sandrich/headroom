@@ -16,6 +16,11 @@ enum Fmt {
         return String(format: "$%.2f", v)
     }
 
+    /// Exact amounts for spend limits, where rounding $124.68 to $125 would hide what is left.
+    static func money(_ v: Double, currency: String) -> String {
+        currency == "USD" ? String(format: "$%.2f", v) : String(format: "%.2f \(currency)", v)
+    }
+
     static func gb(_ b: UInt64) -> String {
         String(format: "%.1f GB", Double(b) / 1_073_741_824)
     }

@@ -89,4 +89,40 @@ struct CodexTests {
         #expect(Ledger.scanCodex(root: root, full: true, files: &files, hot: &hot).changed == 1)
         #expect(keys(files) == ["a", "b", "c", "d"])
     }
+
+    private func json(_ s: String) throws -> [String: Any] {
+        try #require(try JSONSerialization.jsonObject(with: Data(s.utf8)) as? [String: Any])
+    }
+
+    @Test func spendControlAndCredits() throws {
+        let l = CodexClient.parse(try json("""
+            {"plan_type": "business", "rate_limit": null,
+             "spend_control": {"reached": false, "individual_limit": {"remaining_percent": 35, "reset_at": 1795900000}},
+             "credits": {"has_credits": true, "unlimited": false, "balance": "120"}}
+            """))
+        let s = try #require(l.spend)
+        #expect(s.name == "Spend limit")
+        #expect(s.percent == 65)
+        #expect(s.resetsAt == Date(timeIntervalSince1970: 1795900000))
+        #expect(l.credits == "120 credits left")
+        #expect(l.all.isEmpty) // the menu bar gauges stay on the rate limits
+    }
+
+    @Test func reachedSpendLimitAndNumericBalance() throws {
+        let l = CodexClient.parse(try json("""
+            {"plan_type": "business",
+             "spend_control": {"reached": true, "individual_limit": {"remaining_percent": 3}},
+             "credits": {"has_credits": true, "unlimited": false, "balance": 7.5}}
+            """))
+        #expect(l.spend?.percent == 100)
+        #expect(l.credits == "7.50 credits left")
+    }
+
+    @Test func withoutSpendControlOrCredits() throws {
+        let l = CodexClient.parse(try json("""
+            {"plan_type": "plus", "spend_control": {"reached": false, "individual_limit": null},
+             "credits": {"has_credits": true, "unlimited": true, "balance": "0"}}
+            """))
+        #expect(l.spend == nil && l.credits == nil)
+    }
 }

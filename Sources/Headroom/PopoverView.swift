@@ -504,18 +504,24 @@ struct LimitsCard: View {
             if store.claudeAvailable {
                 CardHeader(title: "Claude Code", icon: "sparkle", tint: .claude, trailing: store.claudeLimits?.plan,
                            badges: store.claudeExtra.enumerated().map { i, l in
-                               ([l.account, l.plan].compactMap { $0 }.joined(separator: " · "), tint(i + 1))
+                               ([l.account, l.plan].compactMap { $0 }.joined(separator: " · "), tint(i + (store.claudeLimits == nil ? 0 : 1)))
                            })
-                if let l = store.claudeLimits {
-                    let rows = limitRows([l] + store.claudeExtra)
+                // A failing default login still leaves the extra accounts' bars.
+                let accounts = [store.claudeLimits].compactMap { $0 } + store.claudeExtra
+                if !accounts.isEmpty {
+                    let rows = limitRows(accounts)
                     ForEach(rows.indices, id: \.self) { r in
                         LimitRow(bars: rows[r].map { ($0.entry, tint($0.account)) })
                     }
+                    let spend = spendBars(accounts)
+                    if !spend.isEmpty { LimitRow(bars: spend) }
                 } else {
                     Text(store.claudeError ?? "Loading limits...").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
                 if let err = store.claudeError, store.claudeLimits != nil {
                     Text("\(err), showing data from \(Fmt.ago(store.claudeLimits?.fetchedAt))").font(.system(size: 10)).foregroundStyle(.orange)
+                } else if let err = store.claudeError, !store.claudeExtra.isEmpty {
+                    Text("Default login: \(err)").font(.system(size: 10)).foregroundStyle(.orange)
                 }
             }
             if store.claudeAvailable && store.grokAvailable {
@@ -541,6 +547,8 @@ struct LimitsCard: View {
                 CardHeader(title: "Codex", icon: "chevron.left.forwardslash.chevron.right", tint: .codex, trailing: store.codexLimits?.plan)
                 if let l = store.codexLimits {
                     ForEach(l.all) { LimitRow(entry: $0, tint: .codex) }
+                    if let s = l.spend { LimitRow(entry: s, tint: .codex) }
+                    if let c = l.credits { Text(c).font(.system(size: 10)).foregroundStyle(.secondary) }
                 } else {
                     Text(store.codexError ?? "Loading limits...").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
@@ -558,6 +566,13 @@ struct LimitsCard: View {
         }
         .padding(12)
         .background(CardBackground())
+    }
+
+    /// LimitRow shows only the first entry's note, so with several accounts it carries every account's amounts.
+    private func spendBars(_ accounts: [ClaudeLimits]) -> [(entry: LimitEntry, tint: Color)] {
+        var bars: [(entry: LimitEntry, tint: Color)] = accounts.enumerated().compactMap { i, a in a.spend.map { ($0, tint(i)) } }
+        if bars.count > 1 { bars[0].entry.note = bars.compactMap(\.entry.note).joined(separator: " · ") }
+        return bars
     }
 
     private func window(_ p: GrokPlan) -> TimeInterval? {
